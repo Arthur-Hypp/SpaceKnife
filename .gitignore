@@ -246,3 +246,10 @@ Log/
 
 # Third-party licensed binaries (e.g. WizTree)
 *.exe
+
+# PyInstaller build artifacts (regenerate with build.py)
+CDriveSentinel/build/
+CDriveSentinel/dist/
+*.spec.bak
+# Keep the hand-written build spec (override GitHub's generic *.spec rule)
+!CDriveSentinel/CDriveSentinel.spec

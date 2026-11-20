@@ -30,7 +30,8 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import p1_config as config
 import p1_db as db
@@ -1199,7 +1200,7 @@ def _fatal_to_runlog(exc):
             LOG_FH.write(detail + "\n")
             LOG_FH.flush()
         else:
-            root = Path(__file__).resolve().parent.parent
+            root = config.app_dir()
             p = root / "data" / "run.log"
             p.parent.mkdir(parents=True, exist_ok=True)
             with p.open("a", encoding="utf-8") as fh:

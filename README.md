@@ -59,6 +59,28 @@ python src\main.py usn-status    # USN 权限 / journal / 游标诊断
 
 **重要**：所有产物必须避开监控卷。有第二块盘时程序会自动把 `data_root` 迁过去；单盘时数据落在监控盘的 `CDriveSentinelData/` 子目录并从扫描中排除。
 
+## 打包为独立 exe（Windows）
+
+无需 Python 环境即可分发，产出 `dist/CDriveSentinel/` 文件夹：
+
+```powershell
+cd CDriveSentinel
+python -m pip install pyinstaller   # 仅构建时需要
+python build.py
+```
+
+把整个 `dist/CDriveSentinel/` 文件夹拷到目标电脑即可运行（无需安装 Python）：
+
+```
+CDriveSentinel.exe status
+CDriveSentinel.exe daemon
+CDriveSentinel.exe selftest
+```
+
+- 采用 onedir 模式，配置与数据都在 exe 旁边：首次运行自动生成 `config/config.json`（可编辑），数据写入 `data/`（或自动迁到非监控盘）。
+- 把守护进程注册为开机计划任务（需管理员）：在 `dist/CDriveSentinel/` 内运行 `powershell -ExecutionPolicy Bypass -File .\install_task.ps1`；卸载加 `-Uninstall`。脚本会自动识别 exe 版并以无窗口方式运行。
+- `CDriveSentinel.spec` / `build.py` 为构建配置；不需要的第三方模块已在 spec 中排除，未启用 UPX 压缩以避免杀毒误报。
+
 ## 技术细节
 
 完整的计量口径、数据源分工、差分算法、USN 结构处理与实测记录见 [`CDriveSentinel/docs/DESIGN.md`](CDriveSentinel/docs/DESIGN.md)。

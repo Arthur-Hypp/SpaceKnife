@@ -10,9 +10,25 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+def app_dir() -> Path:
+    """Directory that holds config/ and data/ -- the "project folder".
+
+    Source runs: the parent of src/ (repo layout, unchanged from before).
+    PyInstaller runs: the directory containing the .exe, so config.json and
+    all output data live next to the executable and are user-editable. This
+    is deliberately NOT sys._MEIPASS (the temporary unpack dir), which is
+    wiped on every launch and would lose the database.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent.parent
+
+
+PROJECT_ROOT = app_dir()
 CONFIG_PATH = PROJECT_ROOT / "config" / "config.json"
 
 # Filename of the dedicated data folder used only in the single-drive fallback
@@ -65,6 +81,27 @@ def volume_root(volume: str) -> str:
     return os.path.abspath(text).rstrip("\\/") + "\\"
 
 
+def ensure_config_template(p: Path) -> None:
+    """Create a writable config.json template next to a packaged exe.
+
+    Source runs never call this (the repo already ships config/config.json).
+    Packaged runs call it on first launch so config.json appears beside the
+    exe and the user can edit it; the on-disk copy is then authoritative.
+    """
+    if not getattr(sys, "frozen", False):
+        return
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        template = dict(DEFAULT_CONFIG)
+        template.pop("_config_missing", None)
+        template.pop("_config_path", None)
+        p.write_text(
+            json.dumps(template, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+    except OSError:
+        pass  # read-only location; fall back to built-in defaults in memory
+
+
 def load_config(path=None) -> dict:
     cfg = dict(DEFAULT_CONFIG)
     p = Path(path) if path else CONFIG_PATH
@@ -72,6 +109,7 @@ def load_config(path=None) -> dict:
         user = json.loads(p.read_text(encoding="utf-8"))
         cfg.update(user)
     else:
+        ensure_config_template(p)
         cfg["_config_missing"] = str(p)
     cfg["_config_path"] = str(p)
     return cfg
