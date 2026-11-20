@@ -11,6 +11,9 @@ C 盘空间变化实时监测与归因工具集。回答一个问题：**C 盘�
   - `config/config.json` — 配置（数据目录、扫描范围、USN、告警、日报等）
   - `docs/` — 方案设计与各期修复计划
   - `run_p0.ps1` / `run_p1.ps1` / `install_task.ps1` — PowerShell 启动器与计划任务安装脚本
+  - `build.py` / `CDriveSentinel.spec` / `pack_release.py` — 打包与发布归档脚本
+- **`signpath/`** — SignPath 免费开源代码签名配置与设置指南
+- **`.github/workflows/build-release.yml`** — 打 `v*` tag 时自动构建、送签、发布 Release
 
 ## 特性
 
@@ -80,6 +83,15 @@ CDriveSentinel.exe selftest
 - 采用 onedir 模式，配置与数据都在 exe 旁边：首次运行自动生成 `config/config.json`（可编辑），数据写入 `data/`（或自动迁到非监控盘）。
 - 把守护进程注册为开机计划任务（需管理员）：在 `dist/CDriveSentinel/` 内运行 `powershell -ExecutionPolicy Bypass -File .\install_task.ps1`；卸载加 `-Uninstall`。脚本会自动识别 exe 版并以无窗口方式运行。
 - `CDriveSentinel.spec` / `build.py` 为构建配置；不需要的第三方模块已在 spec 中排除，未启用 UPX 压缩以避免杀毒误报。
+
+## 代码签名（SignPath Foundation）
+
+发布版通过 [SignPath Foundation](https://signpath.org/) 免费开源签名消除 SmartScreen 拦截。签名私钥托管在 SignPath 的 HSM，证书私钥不落地；每次发布由 GitHub Actions 在托管 runner 上构建、送签、人工批准后发布。
+
+- 配置步骤（申请、GitHub App、Secrets/Variables、审批）见 [`signpath/README.md`](signpath/README.md)，签名策略见 [`signpath/CODE_SIGNING_POLICY.md`](signpath/CODE_SIGNING_POLICY.md)。
+- 发布：打一个 `v*` tag 并 push，workflow 自动完成构建 → 送签 → 校验 → 发布带签名的 Release（含 SHA-256）。
+- 尚未配置 SignPath 变量时，同样流程会发布未签名 Release，可先用它作为开源签名申请素材。
+- 验证：`signtool verify /pa CDriveSentinel.exe`。
 
 ## 技术细节
 

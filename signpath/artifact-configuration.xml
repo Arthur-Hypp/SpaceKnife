@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  SignPath artifact configuration for CDriveSentinel.
+
+  Paste this into SignPath: Project > Artifact Configurations > Custom,
+  and give it the slug you will store in the repository variable
+  SIGNPATH_ARTIFACT_CONFIGURATION_SLUG (suggested: windows-exe).
+
+  Why a <zip-file> root: the GitHub Actions workflow uses upload-artifact,
+  which stores the onedir folder as a ZIP. SignPath receives that ZIP,
+  signs the main exe inside it, and returns a new ZIP.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file path="CDriveSentinel.exe">
+      <authenticode-sign/>
+    </pe-file>
+  </zip-file>
+</artifact-configuration>

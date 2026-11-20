@@ -1,0 +1,137 @@
+# Build, (optionally) sign with SignPath Foundation, and publish a Release.
+#
+# Trigger:  push a tag like v0.1.0, or run manually from the Actions tab.
+#
+# Two modes, chosen automatically:
+#   1. SignPath NOT configured yet (no SIGNPATH_* repository variables):
+#      builds and publishes an UNSIGNED Release. Use this first Release as
+#      evidence for your SignPath open-source application.
+#   2. SignPath configured (variables + API token secret set):
+#      submits the built artifact to SignPath for Authenticode signing,
+#      verifies the signature, and publishes the SIGNED Release.
+#
+# All jobs run on GitHub-hosted runners, which SignPath requires for its
+# free open-source signing (it audits that the binary came from this repo's CI).
+name: Build, sign and release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (e.g. v0.1.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write   # create Release and upload assets
+  actions: read     # read artifact metadata for SignPath
+
+jobs:
+  build-sign-release:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
+      PYTHONUTF8: "1"
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Smoke test (source, read-only sandbox)
+        working-directory: CDriveSentinel
+        run: python src\main.py selftest
+
+      - name: Build onedir distributable
+        working-directory: CDriveSentinel
+        run: python build.py
+
+      - name: Upload unsigned artifact for SignPath
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: CDriveSentinel-unsigned
+          path: CDriveSentinel/dist/CDriveSentinel
+          if-no-files-found: error
+          include-hidden-files: true
+          retention-days: 7
+
+      # Only runs once the SignPath project variables are set in the repo.
+      - name: Submit signing request to SignPath Foundation
+        id: signpath
+        if: ${{ vars.SIGNPATH_PROJECT_SLUG != '' }}
+        uses: signpath/github-action-submit-signing-request@v3
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_CONFIGURATION_SLUG }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          wait-for-completion: true
+          wait-for-completion-timeout-in-seconds: 3600
+          output-artifact-directory: signed
+
+      - name: Verify Authenticode signature
+        if: ${{ steps.signpath.outcome == 'success' }}
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem -Recurse -Filter CDriveSentinel.exe -Path signed |
+                 Select-Object -First 1
+          if (-not $exe) { throw "Signed CDriveSentinel.exe not found in signed artifact" }
+          $sig = Get-AuthenticodeSignature -FilePath $exe.FullName
+          Write-Host "Signer : $($sig.SignerCertificate.Subject)"
+          Write-Host "Status : $($sig.Status)"
+          if ($sig.Status -ne 'Valid') {
+            throw "Signature invalid: $($sig.StatusMessage)"
+          }
+
+      - name: Pack release ZIP + SHA-256 (after signing)
+        id: pack
+        shell: pwsh
+        run: |
+          $signed = "${{ steps.signpath.outcome }}" -eq "success"
+          $src = if ($signed) { "signed" } else { "CDriveSentinel/dist/CDriveSentinel" }
+          $out = "CDriveSentinel-$env:RELEASE_TAG-windows.zip"
+          python CDriveSentinel\pack_release.py $src $out
+          if ($signed) {
+            "signed=1" >> $env:GITHUB_OUTPUT
+          } else {
+            "signed=0" >> $env:GITHUB_OUTPUT
+          }
+
+      - name: Publish GitHub Release (unsigned)
+        if: ${{ steps.pack.outputs.signed == '0' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }} (unsigned)
+          generate_release_notes: true
+          files: |
+            CDriveSentinel-*.zip
+            CDriveSentinel-*.zip.sha256
+
+      - name: Publish GitHub Release (signed by SignPath Foundation)
+        if: ${{ steps.pack.outputs.signed == '1' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: ${{ env.RELEASE_TAG }} (signed)
+          body: |
+            Authenticode-signed by [SignPath Foundation](https://signpath.org/) — free code signing for open source.
+            Verify with: `signtool verify /pa CDriveSentinel.exe`
+          generate_release_notes: true
+          files: |
+            CDriveSentinel-*.zip
+            CDriveSentinel-*.zip.sha256
