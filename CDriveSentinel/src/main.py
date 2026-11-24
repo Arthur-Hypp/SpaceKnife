@@ -9,6 +9,10 @@
     python src\\main.py report --day 2026-11-16 --top 20
     python src\\main.py report --since "2026-11-16 02:00" --until "2026-11-16 03:00"
     python src\\main.py status
+    python src\\main.py paths                  # install/data/config layout
+    python src\\main.py scan-now               # ask the daemon for one snapshot
+    python src\\main.py pause | resume         # stop / restart scheduled work
+    python src\\main.py runtime                # control-channel state
     python src\\main.py selftest                # P1 + P2 end-to-end checks on D:
     python src\\main.py usn-status              # USN privileges / journal / cursor
     python src\\main.py usn-poll                # incremental USN read (needs elevation)
@@ -34,6 +38,7 @@ if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import p1_config as config
+import p1_control as control
 import p1_db as db
 import p1_diff as diff
 import p1_report as report
@@ -48,7 +53,13 @@ LOG_FH = None
 
 def log(msg=""):
     text = str(msg)
-    print(text, flush=True)
+    # A detached console (scheduled task, or a closed pipe) raises OSError on
+    # print. Losing the log line is acceptable; dying because stdout vanished
+    # is not -- that is how the collector silently stopped on 2026-11-24.
+    try:
+        print(text, flush=True)
+    except (OSError, ValueError):
+        pass
     if LOG_FH:
         try:
             LOG_FH.write("%s  %s\n" % (
@@ -94,10 +105,18 @@ def volume_state(cfg, allow_none=False):
         raise
 
 
-def do_snapshot(conn, cfg, paths, vol=None, do_diff=True, progress=True):
-    """One READ-ONLY snapshot: gzip CSV archive + SQLite file_state + diff."""
+def do_snapshot(conn, cfg, paths, vol=None, do_diff=True, progress=True,
+                should_stop=None):
+    """One READ-ONLY snapshot: gzip CSV archive + staged scan + inventory merge."""
     roots = config.scope_roots(cfg)
-    scope_hash = config.scope_fingerprint(roots)
+    # Exclusion list: own data folder (when it is on the monitored volume)
+    # plus exclude_paths plus the legacy skip_paths key. Part of the scope
+    # fingerprint so that changing it starts a fresh baseline instead of
+    # reporting every previously-included file as a giant DELETE.
+    exclude = paths.get("exclude")
+    if exclude is None:
+        exclude = config.exclude_prefixes(cfg, paths)
+    scope_hash = config.scope_fingerprint(roots, exclude)
     if vol is None:
         vol = volume_state(cfg)
     db.add_heartbeat(conn, vol)
@@ -125,18 +144,19 @@ def do_snapshot(conn, cfg, paths, vol=None, do_diff=True, progress=True):
     log("[snapshot #%s] start %s  roots=%s  budget=%ss  archive=%s" %
         (sid, ts_local, ", ".join(roots) if len(roots) <= 3 else "%d roots" % len(roots),
          cfg.get("max_scan_seconds"), archive_mode))
-    # In the single-drive fallback the data root sits on the monitored volume.
-    # Exclude it from enumeration so the tool's own DB/logs/snapshots are not
-    # counted as volume growth (self-stimulation).
-    exclude_roots = []
-    if paths.get("same_volume"):
-        exclude_roots = [str(paths["root"])]
-        log("  NOTE: single-drive mode; excluding own data folder from scan: %s" %
-            paths["root"])
+    # Excluded subtrees are pruned during enumeration (no scandir, no stat).
+    # This is what keeps the tool from counting its own database writes as
+    # volume growth -- the "self-stimulation" guard.
+    if exclude:
+        log("  exclude %d folder(s): %s" % (
+            len(exclude),
+            ", ".join(exclude) if len(exclude) <= 3 else
+            ", ".join(exclude[:3]) + " ..."))
     scanner = snap.FileScanner(roots, max_seconds=cfg.get("max_scan_seconds", 900),
                                progress=(lambda n, s: log("  scanned %d files in %.1fs ..." % (n, s)))
                                if progress else None,
-                               exclude_roots=exclude_roots)
+                               exclude_roots=exclude,
+                               should_stop=should_stop)
 
     if csv_path is not None:
         with gzip.open(csv_path, "wt", encoding="utf-8", newline="") as fh:
@@ -148,9 +168,9 @@ def do_snapshot(conn, cfg, paths, vol=None, do_diff=True, progress=True):
                     writer.writerow([row[k] for k in snap.FIELDS])
                     yield row
 
-            count, total = db.bulk_insert_files(conn, sid, rows())
+            count, total = db.stage_files(conn, sid, rows())
     else:
-        count, total = db.bulk_insert_files(conn, sid, scanner.rows())
+        count, total = db.stage_files(conn, sid, scanner.rows())
 
     stats = scanner.stats()
     db.finish_snapshot(conn, sid, stats, str(csv_path) if csv_path else None)
@@ -158,7 +178,22 @@ def do_snapshot(conn, cfg, paths, vol=None, do_diff=True, progress=True):
     log("  files=%d dirs=%d dedup=%d denied=%d reparse=%d bytes=%s elapsed=%.1fs%s" %
         (c["files"], c["dirs"], c["hard_links_deduped"], c["access_denied"],
          c["reparse_points_skipped"], report.human(c["bytes_total"]),
-         stats["elapsed_seconds"], "  PARTIAL(timeout)" if stats["partial"] else ""))
+         stats["elapsed_seconds"],
+         "  PARTIAL(cancelled)" if stats.get("cancelled")
+         else ("  PARTIAL(timeout)" if stats["partial"] else "")))
+    if stats["partial"] and not stats.get("cancelled"):
+        # A timed-out scan produces NOTHING under L3 (its staging area is
+        # discarded), so this must not read like a routine warning: the
+        # inventory stays at the previous snapshot and diffs stop until a scan
+        # fits in the budget. Seen on 2026-11-24 with a 1500 s budget at 906k
+        # of 1.03M files.
+        budget = float(cfg.get("max_scan_seconds", 0) or 0)
+        suggest = int(max(budget * 1.5, 600))
+        log("  NOTE the scan budget is too short for this volume: only %s files "
+            "in %ss and nothing was stored (a partial pass cannot be a "
+            "baseline). Set max_scan_seconds to at least %ds (current %.0fs) "
+            "and the next pass will complete." %
+            (format(c["files"], ","), int(stats["elapsed_seconds"]), suggest, budget))
     log("  archive: %s" % (csv_path if csv_path else "skipped (daily archive already exists)"))
 
     # Second volume sample at scan END: makes the sampling skew visible in the
@@ -172,27 +207,80 @@ def do_snapshot(conn, cfg, paths, vol=None, do_diff=True, progress=True):
 
     result = None
     if do_diff:
-        result = diff.diff_snapshots(conn, cfg, paths, sid, log=log)
+        t_merge = time.monotonic()
+        result = diff.merge_inventory(conn, cfg, paths, sid, log=log)
+        # The merge is the part L3 replaced, so it gets its own timing: the
+        # question "is one inventory faster than two" deserves a number.
+        result["merge_seconds"] = round(time.monotonic() - t_merge, 1)
         if result["status"] == "ok":
             log("  events=%d  attributed=%s  used_delta=%s  residual=%s" %
                 (result["event_count"], report.signed(result["attributed_delta"]),
                  report.signed(result["used_delta"]),
                  report.signed(result["residual_bytes"])))
+            ap = result.get("apply") or {}
+            log("  inventory: %s rows (+%s new, %s changed, %s gone) in %.1fs" % (
+                format(result.get("inventory_rows") or 0, ","),
+                format(ap.get("added", 0), ","), format(ap.get("changed", 0), ","),
+                format(ap.get("removed", 0), ","), result["merge_seconds"]))
+        elif result["status"] == "baseline":
+            log("  inventory baseline: %s rows (no events this window, %.1fs)" %
+                (format(result.get("file_count") or 0, ","), result["merge_seconds"]))
         else:
             log("  diff status: %s" % result["status"])
+    else:
+        # The inventory must always describe the newest scan, otherwise the
+        # NEXT scan would diff against a stale volume and report the gap as
+        # thousands of created/deleted files.
+        t_merge = time.monotonic()
+        files = diff.adopt_scan(conn, sid, scope_hash)
+        log("  diff skipped: inventory adopted as baseline (%s rows, %.1fs)" %
+            (format(files, ","), time.monotonic() - t_merge))
 
     pruned = db.prune(conn, cfg, paths)
     removed = db.prune_archives(paths, cfg)
-    log("  retention: kept snapshots %s, removed %d old archives" %
-        (pruned["kept_snapshot_ids"], removed))
+    log("  retention: -%s events, -%s stale stage rows, -%d archives, "
+        "-%d jsonl logs, %d retired orphan scans (cutoff %s)" %
+        (format(pruned["events"], ","), format(pruned["stage_rows"], ","),
+         removed, pruned["logs_removed"], len(pruned["orphans"]), pruned["cutoff"]))
+    # Give the freed pages back instead of letting the file keep its high-water
+    # mark. Bounded per tick so a snapshot never stalls on a long vacuum.
+    rec = db.reclaim(conn, pages=reclaim_pages(conn, cfg))
+    if rec.get("vacuumed_pages"):
+        log("  reclaim: %s free pages still allocated%s" % (
+            format(rec["vacuumed_pages"], ","),
+            "" if rec.get("wal_truncated") else " (wal checkpoint deferred)"))
+
+    # Hard footprint cap: a tool that exists to free C: must not become the
+    # reason it fills up. Only fires when the budget is actually exceeded.
+    budget = enforce_budget(conn, cfg, paths)
+    if budget.get("steps"):
+        log("  budget: live %s -> %s (limit %.0f MB; file %s)" % (
+            report.human(budget.get("effective", 0)),
+            report.human(budget.get("effective_after", 0)),
+            budget["budget_mb"], report.human(budget["after"]["total"])))
+        try:
+            last = float(db.get_state(conn, "budget.last_alert_ts") or 0)
+        except (TypeError, ValueError):
+            last = 0.0
+        if time.time() - last > 12 * 3600:
+            db.add_alert(conn, "warn", "data_budget",
+                         "own data folder exceeded the %.0f MB budget; "
+                         "oldest history was dropped" % budget["budget_mb"],
+                         budget.get("effective_after", 0) / 1024.0 ** 2)
+            db.set_state(conn, "budget.last_alert_ts", "%.0f" % time.time())
     # USN tables are not covered by p1_db.prune(); without this the event table
     # grows forever (~45 MiB/day measured).
     p2store.init_schema(conn)
     usn_pruned = p2store.prune_usn(conn, cfg)
-    if usn_pruned["events"] or usn_pruned["polls"] or usn_pruned["index_rows"]:
+    if (usn_pruned["events"] or usn_pruned["polls"] or usn_pruned["index_rows"]
+            or usn_pruned.get("index_dropped")):
         log("  usn retention: -%d events, -%d polls, -%d stale index rows (cutoff %s)" %
             (usn_pruned["events"], usn_pruned["polls"],
              usn_pruned["index_rows"], usn_pruned["cutoff"]))
+    if usn_pruned.get("index_dropped"):
+        log("  mft_index disabled: released %s index rows "
+            "(directory paths resolve from the inventory now)" %
+            format(usn_pruned["index_dropped"], ","))
     # Refresh the portal so "current occupancy"/snapshot status track the
     # newest completed snapshot. Non-fatal: never fail a snapshot over HTML.
     try:
@@ -274,6 +362,227 @@ def index_run_is_trustworthy(new_rows, previous_rows, min_ratio=0.8):
     return new_rows >= previous_rows * min_ratio
 
 
+def scan_decision(age, interval, paused, requested, last_request):
+    """One tick's scheduling decision -- pure, so the selftest can assert it.
+
+    Returns ``(due, manual)``:
+
+    * ``due``    -- the regular interval elapsed (or no snapshot exists yet)
+    * ``manual`` -- the UI/CLI asked for a scan we have not served yet
+
+    Pausing wins over both: a paused monitor must not scan even when a request
+    is pending, otherwise "pause" would be a lie on the next tick.
+    """
+    if paused:
+        return False, False
+    due = age is None or age >= interval
+    manual = float(requested or 0.0) > float(last_request or 0.0)
+    return due, manual
+
+
+def _pause_probe(paths, every=5.0):
+    """Cheap ``should_stop`` callable for FileScanner (M1-5).
+
+    Reading the state file once per directory would mean ~150k reads per scan.
+    Throttling to one read every *every* seconds is invisible in the profile
+    while still reacting to a "pause" click within a few seconds.
+    """
+    cache = {"at": 0.0, "paused": False}
+
+    def probe():
+        now = time.monotonic()
+        if now - cache["at"] >= every:
+            cache["at"] = now
+            cache["paused"] = control.is_paused(paths)
+        return cache["paused"]
+
+    return probe
+
+
+def reclaim_pages(conn, cfg) -> int:
+    """How many pages to hand back after this snapshot.
+
+    Steady state needs only the configured slice, but a machine that just shed
+    a few hundred thousand rows would take a dozen snapshots (~6 hours) to
+    converge at 20000 pages a tick. When a lot of space is stranded, take a
+    bigger bite: 100000 pages is ~400 MB and still just a few seconds right
+    after a scan has finished.
+    """
+    base = int(cfg.get("vacuum_pages_per_snapshot", 20000) or 0)
+    try:
+        free = conn.execute("PRAGMA freelist_count").fetchone()[0] or 0
+    except Exception:
+        return base
+    if free > 200000:
+        return min(100000, max(base, free // 4))
+    return base
+
+
+def db_free_bytes(conn) -> int:
+    """Space allocated inside the database file but holding no rows.
+
+    The budget must be measured against *live* data. A database that just shed
+    a million rows looks huge on disk until it is vacuumed; treating those free
+    pages as "usage" would send the budget down its destructive path (dropping
+    inventories and the ledger) to solve a problem that a vacuum solves.
+    """
+    try:
+        pages = conn.execute("PRAGMA freelist_count").fetchone()[0] or 0
+        size = conn.execute("PRAGMA page_size").fetchone()[0] or 4096
+        return int(pages) * int(size)
+    except Exception:
+        return 0
+
+
+def data_usage(p) -> dict:
+    """Bytes this tool occupies on disk, broken down by kind.
+
+    The point of measuring instead of asking SQLite: the -wal file and the
+    gzip archives live outside the database but are just as much "space this
+    tool took from C:".
+    """
+    sizes = {"db": 0, "wal": 0, "snapshots": 0, "logs": 0, "reports": 0}
+    data = Path(p["data"])
+    for name in ("sentinel.db", "sentinel.db-wal", "sentinel.db-shm"):
+        f = data / name
+        if not f.is_file():
+            continue
+        try:
+            sizes["wal" if name != "sentinel.db" else "db"] += f.stat().st_size
+        except OSError:
+            pass
+    for key in ("snapshots", "logs", "reports"):
+        folder = Path(p[key])
+        total = 0
+        for root, _dirs, files in os.walk(str(folder)):
+            for name in files:
+                try:
+                    total += os.path.getsize(os.path.join(root, name))
+                except OSError:
+                    pass
+        sizes[key] = total
+    sizes["total"] = sum(sizes.values())
+    return sizes
+
+
+def enforce_budget(conn, cfg, p, log=log):
+    """Keep this tool's own footprint under ``data_budget_mb``.
+
+    Losing history is always worse than losing disk space, so the steps run in
+    order of "least information lost first" and stop as soon as the footprint
+    is back under budget:
+
+    1. old gzip archives (the newest is kept -- it is the exportable copy)
+    2. USN event detail down to 1 day (the report only needs aggregates)
+    3. the older per-file inventory (1 snapshot is enough for path resolution)
+    4. reclaim pages + truncate the WAL
+    5. the change ledger down to 1 day (last resort)
+
+    Returns a summary the caller can log. ``budget_mb <= 0`` disables it.
+    """
+    budget_mb = float(cfg.get("data_budget_mb", 200) or 0)
+    if budget_mb <= 0:
+        return {"enabled": False}
+    budget = int(budget_mb * 1024 * 1024)
+    before = data_usage(p)
+    free_bytes = db_free_bytes(conn)
+    out = {"enabled": True, "budget_mb": budget_mb, "before": before,
+           "after": before, "steps": [], "free_pages_bytes": free_bytes}
+    # Compare live data, not the file on disk (see db_free_bytes).
+    if before["total"] - free_bytes <= budget:
+        out["effective"] = before["total"] - free_bytes
+        return out
+    out["effective"] = before["total"] - free_bytes
+
+    def current():
+        return data_usage(p)["total"] - db_free_bytes(conn)
+
+    def note(step, value):
+        out["steps"].append({"step": step, **value})
+        log("  budget: %s -> %s (live, limit %s)" %
+            (step, report.human(current()), report.human(budget)))
+
+    # 1. archives: keep the newest one
+    files = sorted(Path(p["snapshots"]).glob("snapshot_*.csv.gz"),
+                   key=lambda f: f.stat().st_mtime, reverse=True)
+    removed = 0
+    for f in files[1:]:
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            pass
+    if removed:
+        note("removed %d gzip archives" % removed, {"removed": removed})
+        if current() <= budget:
+            out["after"] = data_usage(p)
+            return out
+
+    # 2. USN detail -> 1 day
+    p2store.init_schema(conn)
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=1)).strftime(
+        "%Y-%m-%d %H:%M:%S")
+    trimmed = 0
+    while True:
+        cur = conn.execute(
+            "DELETE FROM usn_event WHERE id IN "
+            "(SELECT id FROM usn_event WHERE time_local < ? LIMIT 50000)", (cutoff,))
+        n = cur.rowcount or 0
+        conn.commit()
+        trimmed += max(0, n)
+        if n <= 0:
+            break
+    if trimmed:
+        note("trimmed %s usn events to 1 day" % format(trimmed, ","),
+             {"usn_events": trimmed})
+
+    # 3. rebuildable caches: mft_index + frn_path_map
+    #    They cost ~180 MB here and a re-run of `usn-index` brings them back;
+    #    the per-file inventory below cannot be rebuilt without a full scan, so
+    #    caches must go first.
+    cache_rows = 0
+    for table in ("mft_index", "frn_path_map"):
+        try:
+            cur = conn.execute("DELETE FROM %s" % table)
+            cache_rows += max(0, cur.rowcount or 0)
+            conn.commit()
+        except Exception:
+            pass
+    if cache_rows:
+        note("dropped %s rebuildable index rows" % format(cache_rows, ","),
+             {"cache_rows": cache_rows})
+
+    # 4. the inventory itself. Dropping it costs one full rescan (25 minutes on
+    #    a 1M-file volume) and one diff window, so it comes after the caches
+    #    that can be re-indexed on demand.
+    inv = db.inventory_info(conn)
+    if inv["rows"]:
+        db.reset_inventory(conn)
+        note("dropped the %s-row inventory (next scan re-establishes a baseline)"
+             % format(inv["rows"], ","), {"inventory_rows": inv["rows"]})
+
+    # 5. reclaim
+    rec = db.reclaim(conn, pages=0)
+    note("reclaimed pages / truncated wal", rec)
+    if current() <= budget:
+        out["after"] = data_usage(p)
+        return out
+
+    # 6. ledger -> 1 day (last resort before giving up)
+    while True:
+        cur = conn.execute(
+            "DELETE FROM change_event WHERE id IN "
+            "(SELECT id FROM change_event WHERE ts_local < ? LIMIT 50000)", (cutoff,))
+        n = cur.rowcount or 0
+        conn.commit()
+        if n <= 0:
+            break
+    db.reclaim(conn, pages=0)
+    out["after"] = data_usage(p)
+    out["effective_after"] = current()
+    return out
+
+
 def cmd_daemon(cfg, paths, args):
     conn = db.connect(paths["db"])
     db.init_schema(conn)
@@ -296,12 +605,39 @@ def cmd_daemon(cfg, paths, args):
         (interval, beat, bool(args.once), usn_interval,
          bool(cfg.get("usn_enabled", True)) and not args.no_usn,
          daily_report_enabled, daily_report_hour))
+
+    # M1-5 control channel: the UI can only write <data>/runtime/state.json.
+    # The event is a latency accelerator, not a dependency.
+    control.create_wake_event()
+    # Persisted consumption marker: a tray click that has already been served
+    # must not fire again after a daemon restart.
+    try:
+        last_scan_request = float(db.get_state(conn, "runtime.last_scan_request") or 0.0)
+    except (TypeError, ValueError):
+        last_scan_request = 0.0
+    paused_seen = None
+
     ticks = 0
     try:
         while True:
             ticks += 1
+            state = control.read_state(paths)
+            paused = bool(state.get("paused"))
+            if paused != paused_seen:
+                log("scheduled work %s%s" % (
+                    "PAUSED" if paused else "resumed",
+                    " by %s" % (state.get("by") or "request") if paused else ""))
+                paused_seen = paused
             vol = volume_state(cfg)
-            db.add_heartbeat(conn, vol)
+            # Never let a transient lock kill the collector: a maintenance
+            # VACUUM (or any other writer) briefly takes the database away, and
+            # this call used to be the one unguarded write in the loop -- it
+            # brought the whole daemon down on 2026-11-24 at 17:16.
+            try:
+                db.add_heartbeat(conn, vol)
+            except Exception as exc:
+                log("heartbeat FAILED (daemon continues): %s: %s" %
+                    (type(exc).__name__, exc))
             # Daily report: once per day, after the configured hour, generate
             # YESTERDAY's txt+html and refresh the portal. Run inside a
             # try/except so a report failure never takes down the collector.
@@ -321,7 +657,7 @@ def cmd_daemon(cfg, paths, args):
                     except Exception as exc:
                         log("daily report FAILED (daemon continues): %s: %s" %
                             (type(exc).__name__, exc))
-            if cfg.get("usn_enabled", True) and not args.no_usn:
+            if cfg.get("usn_enabled", True) and not args.no_usn and not paused:
                 current_status = db.get_state(conn, "usn.status")
                 wait = usn_retry if current_status == "permission_denied" else usn_interval
                 if time.monotonic() - last_usn_poll >= wait:
@@ -355,36 +691,68 @@ def cmd_daemon(cfg, paths, args):
                 try:
                     p2store.init_schema(conn)
                     r = p2store.prune_usn(conn, cfg)
-                    if r["events"] or r["polls"] or r["index_rows"]:
+                    if (r["events"] or r["polls"] or r["index_rows"]
+                            or r.get("index_dropped")):
                         log("usn retention: -%d events, -%d polls, -%d stale index rows" %
                             (r["events"], r["polls"], r["index_rows"]))
+                    if r.get("index_dropped"):
+                        log("mft_index disabled: released %s index rows"
+                            % format(r["index_dropped"], ","))
                 except Exception as exc:
                     log("usn retention FAILED (daemon continues): %s: %s" %
                         (type(exc).__name__, exc))
-            age = last_snapshot_age_seconds(conn)
-            due = age is None or age >= interval
+            try:
+                age = last_snapshot_age_seconds(conn)
+            except Exception as exc:
+                log("age query FAILED (daemon continues): %s: %s" %
+                    (type(exc).__name__, exc))
+                age = None
+            try:
+                requested = float(state.get("request_scan") or 0.0)
+            except (TypeError, ValueError):
+                requested = 0.0
+            due, manual = scan_decision(age, interval, paused,
+                                        requested, last_scan_request)
+            if manual:
+                log("manual scan requested at %s (%.0fs ago)" % (
+                    datetime.datetime.fromtimestamp(requested).strftime("%H:%M:%S"),
+                    max(0.0, time.time() - requested)))
             free_gb = vol["free_bytes"] / (1024.0 ** 3)
-            if (not due and cfg.get("snapshot_on_alert", True) and
+            if (not due and not paused and cfg.get("snapshot_on_alert", True) and
                     free_gb < float(cfg.get("alert_free_gb_below", 10)) and
                     age is not None and age >= 1800):
                 log("low free space %.2f GiB: triggering an extra snapshot" % free_gb)
                 db.add_alert(conn, "warn", "low_free_space",
                              "C: free %.2f GiB, extra snapshot triggered" % free_gb, free_gb)
                 due = True
-            if due:
+            if due or manual:
                 try:
-                    do_snapshot(conn, cfg, paths, vol=vol)
+                    do_snapshot(conn, cfg, paths, vol=vol,
+                                should_stop=_pause_probe(paths))
                 except Exception as exc:
                     log("snapshot FAILED (daemon continues): %s: %s" %
                         (type(exc).__name__, exc))
+                finally:
+                    # Consume everything requested up to now -- including
+                    # clicks that arrived while the scan was running, so a
+                    # second full scan does not start immediately after.
+                    last_scan_request = time.time()
+                    try:
+                        db.set_state(conn, "runtime.last_scan_request",
+                                     "%.3f" % last_scan_request)
+                    except Exception:
+                        pass
             if args.once:
                 break
             if args.max_runtime and time.monotonic() - started >= args.max_runtime:
                 log("max-runtime reached, daemon exits cleanly")
                 break
-            time.sleep(beat)
+            # Wakes within ~WAIT_SLICE on a pause/scan request, or immediately
+            # when the named event can be signalled across the privilege gap.
+            control.wait_for_request(paths, beat)
     except KeyboardInterrupt:
         log("daemon interrupted, exiting cleanly")
+    control.close_wake_event()
     conn.close()
     log("daemon stopped after %d ticks" % ticks)
     return 0
@@ -511,6 +879,18 @@ def cmd_status(cfg, paths, args):
     log("CDriveSentinel P1 status")
     log("  db              : %s (%s)" % (paths["db"], report.human(paths["db"].stat().st_size)))
     log("  config          : %s" % cfg.get("_config_path"))
+    log("  runtime         : %s" % control.describe(paths))
+    usage = data_usage(paths)
+    budget_mb = float(cfg.get("data_budget_mb", 0) or 0)
+    log("  footprint       : %s (db %s + wal %s + archives %s + logs/reports %s)%s" % (
+        report.human(usage["total"]), report.human(usage["db"]),
+        report.human(usage["wal"]), report.human(usage["snapshots"]),
+        report.human(usage["logs"] + usage["reports"]),
+        "  [budget %.0f MB]" % budget_mb if budget_mb > 0 else ""))
+    free_pages = db_free_bytes(conn)
+    if free_pages:
+        log("  reclaimable     : %s free pages inside the db (run `maintenance` "
+            "when the daemon is idle to shrink the file)" % report.human(free_pages))
     log("  volume / root   : %s / %s" % (cfg.get("volume"), paths["volume_root"]))
     log("  snapshots       : %s (last %s)" % (
         one("SELECT COUNT(*) FROM snapshot_meta"),
@@ -521,7 +901,11 @@ def cmd_status(cfg, paths, args):
     log("  diff runs       : %s" % one("SELECT COUNT(*) FROM diff_run"))
     log("  change events   : %s" % one("SELECT COUNT(*) FROM change_event"))
     log("  alerts          : %s" % one("SELECT COUNT(*) FROM alert"))
-    log("  file_state rows : %s" % one("SELECT COUNT(*) FROM file_state"))
+    inv = db.inventory_info(conn)
+    log("  inventory       : %s rows (files+dirs), %s of files "
+        "(as of snapshot #%s, scope %s)" % (
+        format(inv["rows"], ","), report.human(inv["bytes"]),
+        inv["snapshot_id"] or "-", inv["scope_hash"] or "-"))
     # Show the newest COMPLETED snapshot; a row inserted at scan start has NULL
     # file_count and would render as a misleading "files=None total=0 B".
     last = conn.execute("SELECT * FROM snapshot_meta WHERE file_count IS NOT NULL "
@@ -651,7 +1035,8 @@ def run_usn_poll(conn, cfg, paths, max_records=None, reason_mask=None):
             "; ".join(filter(None, [state["reason"],
                                     "truncated at max_records" if stats.get("truncated") else ""]))))
         n_events, resolver_stats = p2store.save_events(
-            conn, poll_id, aggregated, resolver, cfg)
+            conn, poll_id, aggregated, resolver, cfg,
+            exclude=list(paths.get("exclude") or []))
         linked = p2store.link_to_changes(conn)
         db.set_state(conn, "usn.last_usn", cursor)
         db.set_state(conn, "usn.journal_id", journal["journal_id"])
@@ -674,21 +1059,37 @@ def run_usn_poll(conn, cfg, paths, max_records=None, reason_mask=None):
 
 
 def cmd_maintenance(cfg, paths, args):
-    """One-off: convert the DB to incremental auto-vacuum and reclaim pages."""
+    """One-off: compact the database, truncate the WAL, report the footprint."""
+    before = data_usage(paths)
+    log("maintenance: footprint before = %s (db %s + wal %s + archives %s)" %
+        (report.human(before["total"]), report.human(before["db"]),
+         report.human(before["wal"]), report.human(before["snapshots"])))
     conn = db.connect(paths["db"])
     db.init_schema(conn)
     p2store.init_schema(conn)
-    before = paths["db"].stat().st_size
     conn.commit()
+    # dir_path keeps a string per directory forever; sweeping it reads the
+    # whole inventory, which is why it lives here and not in every snapshot.
+    swept = db.prune(conn, cfg, paths, sweep_dirs=True)
+    if swept["dirs"] or swept["stage_rows"]:
+        log("maintenance: pruned %s stale stage rows, %s orphan dir paths" %
+            (format(swept["stage_rows"], ","), format(swept["dirs"], ",")))
     conn.isolation_level = None           # VACUUM cannot run inside a transaction
     conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
     conn.execute("VACUUM")
-    conn.execute("PRAGMA incremental_vacuum")
+    rec = db.reclaim(conn, pages=0)
     conn.close()
-    after = paths["db"].stat().st_size
-    log("maintenance: %s -> %s (reclaimed %s)" %
-        (report.human(before), report.human(after),
-         report.human(max(0, before - after))))
+    after = data_usage(paths)
+    log("maintenance: footprint after  = %s (db %s + wal %s + archives %s)" %
+        (report.human(after["total"]), report.human(after["db"]),
+         report.human(after["wal"]), report.human(after["snapshots"])))
+    log("maintenance: reclaimed %s%s" % (
+        report.human(max(0, before["total"] - after["total"])),
+        "" if rec.get("wal_truncated") else " (wal checkpoint deferred)"))
+    budget_mb = float(cfg.get("data_budget_mb", 0) or 0)
+    if budget_mb > 0:
+        log("maintenance: budget %.0f MB -> %s" % (
+            budget_mb, "OK" if after["total"] <= budget_mb * 1024 * 1024 else "STILL OVER"))
     return 0
 
 
@@ -812,27 +1213,68 @@ def cmd_usn_index(cfg, paths, args):
 
 
 def cmd_prune(cfg, paths, args):
-    """Manual retention entry point: USN tables + stale MFT generations."""
+    """Apply retention now: inventories, archives, USN tables, then reclaim.
+
+    This is the manual version of what every snapshot tick does, plus a full
+    page reclaim. Useful right after changing a retention knob.
+    """
     if not paths["db"].is_file():
         log("database not found; run init-db / snapshot first")
         return 2
+    before = data_usage(paths)
     conn = db.connect(paths["db"])
     db.init_schema(conn)
     p2store.init_schema(conn)
-    r = p2store.prune_usn(conn, cfg, dry_run=bool(args.dry_run))
-    log("prune: cutoff=%s  usn_event=%d rows  usn_poll=%d rows  mft_index=%d rows  (%s)" %
-        (r["cutoff"], r["events"], r["polls"], r["index_rows"],
-         "dry-run" if r["dry_run"] else "applied"))
-    if r["dry_run"]:
+
+    if args.dry_run:
+        r = p2store.prune_usn(conn, cfg, dry_run=True)
+        log("prune (dry-run): usn cutoff=%s  usn_event=%d rows  usn_poll=%d rows  "
+            "mft_index=%d rows" % (r["cutoff"], r["events"], r["polls"],
+                                   r["index_rows"]))
         log("  dry-run: nothing was deleted; drop --dry-run to apply")
-    elif r["events"]:
-        log("  deleted in %d batches; incremental_vacuum issued" % r["batches"])
+        conn.close()
+        return 0
+
+    pruned = db.prune(conn, cfg, paths, sweep_dirs=True)
+    log("prune: -%s events, -%s stale stage rows, -%s orphan dir paths, "
+        "-%d jsonl logs, %d retired orphan scans (cutoff %s)" %
+        (format(pruned["events"], ","), format(pruned["stage_rows"], ","),
+         format(pruned["dirs"], ","), pruned["logs_removed"],
+         len(pruned["orphans"]), pruned["cutoff"]))
+    removed = db.prune_archives(paths, cfg)
+    log("prune: removed %d old gzip archives" % removed)
+
+    r = p2store.prune_usn(conn, cfg)
+    log("prune: usn cutoff=%s  usn_event=%d rows  usn_poll=%d rows  mft_index=%d rows "
+        "(%d batches)" % (r["cutoff"], r["events"], r["polls"],
+                          r["index_rows"], r["batches"]))
+    if r.get("index_dropped"):
+        log("  mft_index disabled: released %s rows" %
+            format(r["index_dropped"], ","))
     if r.get("index_run"):
         log("  mft_index keep_run=%s" % r["index_run"])
     elif r.get("index_note"):
         log("  mft_index: %s (stale count is an estimate until usn-index reruns)"
             % r["index_note"])
+    # Reclaim in bounded chunks: one unbounded incremental_vacuum on a 2 GiB
+    # database holds the write lock long enough to make the running daemon's
+    # inserts time out. Each chunk commits and releases the lock.
+    for _ in range(400):
+        chunk = db.reclaim(conn, pages=20000)
+        if (chunk.get("vacuumed_pages") or 0) <= 0:
+            break
+    rec = db.reclaim(conn, pages=0)
     conn.close()
+    after = data_usage(paths)
+    log("prune: footprint %s -> %s (reclaimed %s)%s" % (
+        report.human(before["total"]), report.human(after["total"]),
+        report.human(max(0, before["total"] - after["total"])),
+        "" if rec.get("wal_truncated") else " (wal checkpoint deferred)"))
+    budget_mb = float(cfg.get("data_budget_mb", 0) or 0)
+    if budget_mb > 0:
+        log("prune: budget %.0f MB -> %s" % (
+            budget_mb,
+            "OK" if after["total"] <= budget_mb * 1024 * 1024 else "STILL OVER"))
     return 0
 
 
@@ -881,8 +1323,7 @@ def cmd_selftest(cfg, paths, args):
     scfg = dict(cfg)
     scfg.update({"volume": str(fixture), "scope": [str(fixture)],
                  "max_scan_seconds": 60, "snapshot_on_alert": False,
-                 "alert_free_gb_below": 0, "keep_file_state_snapshots": 5,
-                 "keep_snapshot_archives": 5})
+                 "alert_free_gb_below": 0, "keep_snapshot_archives": 5})
     novol = {"total_bytes": 0, "used_bytes": 0, "free_bytes": 0}
 
     def put(name, mib):
@@ -946,6 +1387,243 @@ def cmd_selftest(cfg, paths, args):
           "attributed=%s" % (run["attributed_delta"] if run else None))
     check("sandbox stays off the monitored C: volume",
           os.path.splitdrive(str(sandbox))[0].upper() != "C:")
+
+    # ---- L3: one inventory, updated in place -----------------------------
+    inv = db.inventory_info(conn)
+    last_scan = conn.execute(
+        "SELECT file_count, stats_json FROM snapshot_meta ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    last_dirs = json.loads(last_scan["stats_json"] or "{}").get(
+        "counters", {}).get("dirs", 0)
+    staged = conn.execute("SELECT COUNT(*) FROM scan_stage").fetchone()[0]
+    check("L3 inventory holds exactly ONE copy of the volume",
+          inv["rows"] == last_scan["file_count"] + last_dirs and staged == 0,
+          "inventory=%s scan=%s files + %s dirs, staged=%s" %
+          (inv["rows"], last_scan["file_count"], last_dirs, staged))
+    check("L3 inventory records the snapshot it describes",
+          inv["snapshot_id"] == conn.execute(
+              "SELECT MAX(id) FROM snapshot_meta").fetchone()[0],
+          "baseline=%s" % inv["snapshot_id"])
+    last_note = (conn.execute("SELECT note FROM diff_run ORDER BY id DESC LIMIT 1")
+                 .fetchone() or [""])[0] or ""
+    check("L3 merge records what it applied to the inventory",
+          "single inventory" in last_note, last_note)
+
+    # ---- M1-2: scan exclusion list (exclude_paths) ----------------------
+    skip_dir = fixture / "__skip__"
+    skip_dir.mkdir()
+    (skip_dir / "ignored.bin").write_bytes(b"z" * (4 * mib))
+
+    plain = snap.FileScanner([str(fixture)], max_seconds=60)
+    plain_paths = [r["path"].lower() for r in plain.rows()]
+    check("without exclusion the folder IS enumerated",
+          any(p.endswith("ignored.bin") for p in plain_paths),
+          "%d rows" % len(plain_paths))
+
+    scfg_ex = dict(scfg)
+    scfg_ex["exclude_paths"] = [str(skip_dir)]
+    ex_list = config.exclude_prefixes(scfg_ex, sp)
+    check("exclude_prefixes() resolves and normalises the entry",
+          len(ex_list) == 1 and ex_list[0].endswith("__skip__")
+          and ex_list[0] == ex_list[0].lower(), str(ex_list))
+    check("exclusion changes the scope fingerprint",
+          config.scope_fingerprint(config.scope_roots(scfg_ex), ex_list)
+          != config.scope_fingerprint(config.scope_roots(scfg), []),
+          "changes baseline instead of faking DELETEs")
+
+    res_ex = do_snapshot(conn, scfg_ex, sp, vol=novol, do_diff=True, progress=False)
+    in_state = conn.execute(
+        "SELECT COUNT(*) FROM file_state f JOIN dir_path d ON d.id=f.dir_id "
+        "WHERE d.path LIKE ?", ("%__skip__%",)).fetchone()[0]
+    in_events = conn.execute(
+        "SELECT COUNT(*) FROM change_event WHERE path LIKE ?",
+        ("%__skip__%",)).fetchone()[0]
+    check("excluded folder yields no file_state rows", in_state == 0, str(in_state))
+    check("excluded folder yields no change_event rows", in_events == 0, str(in_events))
+    check("scanner reports skipped excluded entries",
+          res_ex["stats"]["counters"].get("excluded_skipped", 0) >= 1,
+          str(res_ex["stats"]["counters"].get("excluded_skipped")))
+    check("changed exclusion starts a baseline (no phantom DELETEs)",
+          res_ex["diff"] is not None and res_ex["diff"]["status"] == "baseline",
+          str((res_ex["diff"] or {}).get("status")))
+
+    guard_cfg = dict(scfg)
+    guard_cfg["exclude_paths"] = [str(sandbox)]
+    check("an exclusion that contains a scan root is ignored",
+          config.exclude_prefixes(guard_cfg, sp) == [],
+          "would have emptied the scan")
+
+    # ---- M1-5: control channel (state file + scheduling decisions) -------
+    rt = control.runtime_dir(sp)
+    check("control: runtime dir sits under <data>",
+          rt == sp["data"] / "runtime", str(rt))
+    check("control: nothing requested by default",
+          control.read_state(sp)["paused"] is False
+          and control.read_state(sp)["request_scan"] == 0.0,
+          control.describe(sp))
+
+    t_req = control.request_scan(sp, by="selftest")["request_scan"]
+    check("control: scan request is recorded",
+          t_req > 0 and control.read_state(sp)["request_scan"] == t_req,
+          control.describe(sp))
+    control.set_paused(sp, True, by="selftest")
+    check("control: pause flag round-trips",
+          control.is_paused(sp) is True
+          and "paused=yes" in control.describe(sp), control.describe(sp))
+    control.set_paused(sp, False, by="selftest")
+    check("control: resume clears the flag", control.is_paused(sp) is False)
+
+    # atomic write: a temp file must never be left behind
+    leftovers = sorted(p.name for p in rt.glob("*.tmp*"))
+    check("control: state file written atomically",
+          leftovers == [] and control.state_path(sp).is_file(), str(leftovers))
+
+    control.state_path(sp).write_text("{not json", encoding="utf-8")
+    bad = control.read_state(sp)
+    check("control: corrupt state file degrades to defaults",
+          bad["paused"] is False and bad["request_scan"] == 0.0, str(bad))
+
+    now_ts = 1000.0
+    check("control: scan_decision honours the interval",
+          scan_decision(age=2000, interval=1800, paused=False,
+                        requested=0, last_request=0) == (True, False)
+          and scan_decision(age=10, interval=1800, paused=False,
+                            requested=0, last_request=0) == (False, False),
+          "due when age>=interval")
+    check("control: scan_decision serves an unserved request",
+          scan_decision(age=10, interval=1800, paused=False,
+                        requested=now_ts, last_request=now_ts - 1) == (False, True)
+          and scan_decision(age=10, interval=1800, paused=False,
+                            requested=now_ts, last_request=now_ts) == (False, False),
+          "request newer than the consumed marker")
+    check("control: pause overrides both triggers",
+          scan_decision(age=99999, interval=1800, paused=True,
+                        requested=now_ts, last_request=0) == (False, False),
+          "a paused monitor must not scan")
+
+    inv_before = db.inventory_info(conn)
+    res_cancel = do_snapshot(conn, scfg, sp, vol=novol, do_diff=True,
+                             progress=False, should_stop=lambda: True)
+    inv_after = db.inventory_info(conn)
+    cancel_row = conn.execute(
+        "SELECT partial FROM snapshot_meta WHERE id=?",
+        (res_cancel["snapshot_id"],)).fetchone()
+    check("control: a stopped scan is stored as PARTIAL",
+          res_cancel["stats"].get("cancelled") is True
+          and cancel_row is not None and cancel_row["partial"] == 1
+          and (res_cancel["diff"] or {}).get("status") == "partial",
+          "cancelled=%s partial=%s" % (
+              res_cancel["stats"].get("cancelled"),
+              cancel_row["partial"] if cancel_row else None))
+    # The staging table is what makes this safe: a half-scanned volume must
+    # never become the baseline, or the unscanned half looks deleted next time.
+    check("L3 a cancelled scan leaves the inventory and baseline untouched",
+          inv_after["rows"] == inv_before["rows"]
+          and inv_after["snapshot_id"] == inv_before["snapshot_id"]
+          and conn.execute("SELECT COUNT(*) FROM scan_stage").fetchone()[0] == 0,
+          "rows %s->%s baseline #%s" % (
+              inv_before["rows"], inv_after["rows"], inv_after["snapshot_id"]))
+
+    # A lost inventory must re-establish a baseline, never report the whole
+    # volume as newly created (the "phantom 100 GB" failure mode).
+    events_before = conn.execute("SELECT COUNT(*) FROM change_event").fetchone()[0]
+    db.reset_inventory(conn)
+    res_rebuild = do_snapshot(conn, scfg, sp, vol=novol, do_diff=True,
+                              progress=False)
+    events_after = conn.execute("SELECT COUNT(*) FROM change_event").fetchone()[0]
+    check("L3 a lost inventory starts a baseline instead of a CREATE flood",
+          (res_rebuild["diff"] or {}).get("status") == "baseline"
+          and events_after == events_before,
+          "status=%s new_events=%s" % (
+              (res_rebuild["diff"] or {}).get("status"),
+              events_after - events_before))
+
+    # ---- L1/L3 footprint: prune, reclaim, hard budget --------------------
+    prune_db = sandbox / "prune.db"
+    conn_p = db.connect(prune_db)
+    db.init_schema(conn_p)
+    conn_p.execute("INSERT OR IGNORE INTO dir_path(path) VALUES ('C:')")
+    did = conn_p.execute("SELECT id FROM dir_path WHERE path='C:'").fetchone()[0]
+
+    def add_snap(ts, complete=True):
+        conn_p.execute("""INSERT INTO snapshot_meta
+            (ts_utc, ts_local, source, root, scope_hash, partial, used_bytes,
+             free_bytes, total_bytes, cluster_size, file_count)
+            VALUES ('', ?, 'x', 'C:////', 'h', 0, 0, 0, 0, 4096, ?)""",
+            (ts, 3 if complete else None))
+        return conn_p.execute("SELECT MAX(id) FROM snapshot_meta").fetchone()[0]
+
+    # A scan that died mid-way long ago (file_count NULL, stale timestamp).
+    orphan_id = add_snap("2026-11-24 09:00:00", complete=False)
+    add_snap("2026-11-24 10:01:00")
+    newest = add_snap("2026-11-24 10:02:00")
+    # L3: ONE inventory, plus staging rows from the abandoned scan and from the
+    # scan that is still current.
+    conn_p.executemany("""INSERT INTO file_state
+        (frn, dir_id, name, logical_size, allocated_size, mtime, attributes, is_dir)
+        VALUES (?,?,?,?,?,?,?,?)""",
+        [(j, did, "f%d" % j, 1, 1, 0, 0, 0) for j in range(3)])
+    conn_p.executemany("""INSERT INTO scan_stage
+        (snapshot_id, frn, dir_id, name, logical_size, allocated_size, mtime,
+         attributes, is_dir) VALUES (?,?,?,?,?,?,?,?,?)""",
+        [(orphan_id, 9, did, "stale.txt", 1, 1, 0, 0, 0),
+         (newest, 8, did, "current.txt", 1, 1, 0, 0, 0)])
+    conn_p.commit()
+
+    pruned_p = db.prune(conn_p, dict(scfg, max_scan_seconds=900), sp, sweep_dirs=True)
+    inv_rows = conn_p.execute("SELECT COUNT(*) FROM file_state").fetchone()[0]
+    check("prune never touches the single inventory (L3)",
+          inv_rows == 3, "rows=%s" % inv_rows)
+    check("prune drops the staging area of an abandoned scan",
+          pruned_p["stage_rows"] == 1
+          and conn_p.execute("SELECT COUNT(*) FROM scan_stage").fetchone()[0] == 1,
+          "stage_rows=%s" % pruned_p["stage_rows"])
+    check("prune retires an abandoned scan (file_count NULL, stale)",
+          pruned_p["orphans"] == [orphan_id]
+          and conn_p.execute("SELECT pruned FROM snapshot_meta WHERE id=?",
+                             (orphan_id,)).fetchone()[0] == 1,
+          "orphans=%s" % pruned_p["orphans"])
+    rec_p = db.reclaim(conn_p, pages=0)
+    check("reclaim truncates the WAL",
+          rec_p.get("wal_truncated") is True and
+          prune_db.with_name(prune_db.name + "-wal").stat().st_size
+          <= db.WAL_LIMIT_BYTES,
+          "wal=%s limit=%s" % (
+              prune_db.with_name(prune_db.name + "-wal").stat().st_size,
+              db.WAL_LIMIT_BYTES))
+    conn_p.close()
+
+    # budget: the tool must shrink itself instead of growing on a full C:
+    bud = sandbox / "budget"
+    bsp = {"root": bud, "data": bud / "data", "db": bud / "data" / "sentinel.db",
+           "snapshots": bud / "snapshots", "logs": bud / "data" / "logs",
+           "reports": bud / "reports", "volume_root": "C:\\",
+           "monitored_drive": "C:"}
+    for key in ("data", "snapshots", "logs", "reports"):
+        bsp[key].mkdir(parents=True, exist_ok=True)
+    for i in range(3):
+        (bsp["snapshots"] / ("snapshot_2026112%d_00000%d.csv.gz" % (i, i))
+         ).write_bytes(b"z" * 4096)
+    conn_b = db.connect(bsp["db"])
+    db.init_schema(conn_b)
+    usage_b = data_usage(bsp)
+    check("data_usage counts archives outside the database",
+          usage_b["snapshots"] == 3 * 4096 and usage_b["total"] >= 3 * 4096,
+          "archives=%s total=%s" % (usage_b["snapshots"], usage_b["total"]))
+    bcfg = dict(scfg)
+    bcfg["data_budget_mb"] = 0.001          # ~1 KiB: forces every step
+    bres = enforce_budget(conn_b, bcfg, bsp)
+    archives_left = list(bsp["snapshots"].glob("snapshot_*.csv.gz"))
+    check("budget trims archives first, keeping the newest",
+          len(archives_left) == 1 and bres["steps"]
+          and "gzip" in bres["steps"][0]["step"], str(len(archives_left)))
+    check("budget reports before/after",
+          bres["before"]["total"] > bres["after"]["total"]
+          or bres["after"]["total"] <= 1024, str(bres["after"]["total"]))
+    bcfg["data_budget_mb"] = 0
+    check("budget 0 disables enforcement",
+          enforce_budget(conn_b, bcfg, bsp) == {"enabled": False}, "disabled")
+    conn_b.close()
 
     # ---- P2: USN record parsing, cursor state machine, storage & linking ----
     import sqlite3
@@ -1032,10 +1710,14 @@ def cmd_selftest(cfg, paths, args):
 
     p2store.init_schema(conn)
     known = "0x000b0000000bf2e6"
+    conn.execute("INSERT OR IGNORE INTO dir_path(path) VALUES ('D:\\sandbox')")
+    sandbox_dir = conn.execute(
+        "SELECT id FROM dir_path WHERE path='D:\\sandbox'").fetchone()[0]
+    # L3: the resolver reads the one inventory, so the fixture is a plain row.
     conn.execute("""INSERT OR REPLACE INTO file_state
-        (frn, snapshot_id, path, logical_size, allocated_size, mtime_utc,
+        (frn, dir_id, name, logical_size, allocated_size, mtime,
          attributes, is_dir) VALUES (?,?,?,?,?,?,?,?)""",
-        (known, 2, "D:\\sandbox\\known.txt", 4096, 4096, "", 0, 0))
+        (db.frn_to_int(known), sandbox_dir, "known.txt", 4096, 4096, 0, 0, 0))
     conn.execute("""INSERT INTO change_event
         (ts_utc, ts_local, window_start, window_end, frn, path, top_dir,
          op, delta_bytes, evidence, confidence, note)
@@ -1048,6 +1730,21 @@ def cmd_selftest(cfg, paths, args):
     resolved, _ = resolver.resolve(p2[0])
     check("P2 path resolved from P1 snapshot",
           resolved == "D:\\sandbox\\known.txt", resolved)
+    # L3 replaced mft_index with directory rows: an event whose own FRN is
+    # unknown but whose parent is a KNOWN directory must resolve through the
+    # live inventory alone. This is the property that lets a 159 MB MFT copy
+    # be dropped without losing parent attribution.
+    dir_row = conn.execute(
+        "SELECT frn, name FROM file_state WHERE is_dir = 1 LIMIT 1").fetchone()
+    parents_before = resolver.stats["parent"]
+    ghost = {"frn": "0x0000000000dead01", "name": "ghost.log",
+             "parent_frn": db.frn_to_text(dir_row["frn"]) if dir_row else ""}
+    ghost_path, _ = resolver.resolve(ghost)
+    check("L3 parent path resolves from a directory row (no mft_index)",
+          dir_row is not None and ghost_path.endswith("\\ghost.log")
+          and "unresolved" not in ghost_path
+          and resolver.stats["parent"] == parents_before + 1,
+          str(ghost_path))
     twin = dict(p2[0], reason_mask=0x2, reason_names=["DATA_EXTEND"])
     agg = p2store.aggregate([p2[0], twin])
     check("P2 events aggregated by (frn, op)",
@@ -1066,6 +1763,17 @@ def cmd_selftest(cfg, paths, args):
     check("P2 link upgrades P1 row to usn+snapshot / high",
           linked["upgraded"] >= 1 and ch_row["evidence"] == "usn+snapshot"
           and ch_row["confidence"] == "high" and ch_row["reason_mask"] == 0x102)
+
+    before = conn.execute("SELECT COUNT(*) FROM usn_event").fetchone()[0]
+    poll2 = p2store.save_poll(conn, {"action": "selftest", "status": "ok",
+                                     "record_count": 1})
+    kept_n, kept_stats = p2store.save_events(
+        conn, poll2, agg, resolver, scfg, exclude=[r"D:\sandbox"])
+    after = conn.execute("SELECT COUNT(*) FROM usn_event").fetchone()[0]
+    check("USN events under an excluded path are dropped",
+          kept_n == 0 and kept_stats.get("excluded") == 1 and after == before,
+          "kept=%s excluded=%s rows %s->%s" % (
+              kept_n, kept_stats.get("excluded"), before, after))
 
     # ---- P2.2: ENUM EOF handling + MFT parent-chain resolution ----
     class _EnumStub(usn.UsnJournal):
@@ -1229,12 +1937,73 @@ def cmd_selftest(cfg, paths, args):
     return 1 if failed else 0
 
 
+def cmd_paths(cfg, paths, args):
+    """Print the resolved install/data/config layout (M1-1 diagnostics)."""
+    info = config.layout_info(cfg)
+    log("CDriveSentinel layout")
+    for key in ("frozen", "portable", "install", "data_root", "config",
+                "config_file", "db", "reports", "on_monitored_volume",
+                "auto_relocated"):
+        log("  %-18s: %s" % (key, info[key]))
+    excluded = info["exclude"]
+    if excluded:
+        log("  %-18s: %s" % ("exclude[0]", excluded[0]))
+        for item in excluded[1:]:
+            log("  %-18s  %s" % ("", item))
+    else:
+        log("  %-18s: (none)" % "exclude")
+    if info["on_monitored_volume"]:
+        log("  note              : data folder is on the monitored volume; "
+            "its subtree is excluded from scanning")
+    return 0
+
+
+def cmd_runtime(cfg, paths, args):
+    """Print the control-channel state (M1-5)."""
+    log("CDriveSentinel runtime")
+    log("  %s" % control.describe(paths))
+    return 0
+
+
+def cmd_scan_now(cfg, paths, args):
+    """Ask the running daemon for one immediate snapshot. No elevation needed.
+
+    This writes <data>/runtime/state.json and nudges a named event; the elevated
+    daemon is the only process that actually opens the volume.
+    """
+    state = control.request_scan(paths, by="cli")
+    woken = control.signal_wake()
+    log("scan requested at %s" % datetime.datetime.fromtimestamp(
+        state["request_scan"]).strftime("%H:%M:%S"))
+    log("  %s" % ("daemon woken by event" if woken else
+                  "daemon will pick it up within %ds (event not signalled)"
+                  % control.WAIT_SLICE))
+    log("  %s" % control.describe(paths))
+    return 0
+
+
+def cmd_pause(cfg, paths, args):
+    control.set_paused(paths, True, by="cli")
+    control.signal_wake()
+    log("monitor PAUSED: snapshots and USN polling stop; heartbeats continue")
+    log("  a scan already running is cancelled within a few seconds")
+    return 0
+
+
+def cmd_resume(cfg, paths, args):
+    control.set_paused(paths, False, by="cli")
+    control.signal_wake()
+    log("monitor resumed")
+    return 0
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(
         description="CDriveSentinel P1 - read-only C: drive change attribution")
     parser.add_argument("command", nargs="?", default=None,
                         help="init-db | snapshot | heartbeat | daemon | report | "
-                             "open-report | status | selftest | usn-status | "
+                             "open-report | status | paths | scan-now | pause | "
+                             "resume | runtime | selftest | usn-status | "
                              "usn-poll | usn-index | prune | maintenance")
     parser.add_argument("--mode", default=None, help="alias for command (DESIGN.md style)")
     parser.add_argument("--config", default=None, help="path to config.json")
@@ -1281,6 +2050,11 @@ def main(argv=None):
         "report": cmd_report,
         "open-report": cmd_open_report,
         "status": cmd_status,
+        "paths": cmd_paths,
+        "scan-now": cmd_scan_now,
+        "pause": cmd_pause,
+        "resume": cmd_resume,
+        "runtime": cmd_runtime,
         "selftest": cmd_selftest,
         "usn-status": cmd_usn_status,
         "usn-poll": cmd_usn_poll,
@@ -1309,7 +2083,7 @@ def _fatal_to_runlog(exc):
             LOG_FH.write(detail + "\n")
             LOG_FH.flush()
         else:
-            root = config.app_dir()
+            root = config.data_dir()
             p = root / "data" / "run.log"
             p.parent.mkdir(parents=True, exist_ok=True)
             with p.open("a", encoding="utf-8") as fh:

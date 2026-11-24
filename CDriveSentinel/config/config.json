@@ -1,5 +1,5 @@
 {
-  "_comment": "CDriveSentinel config. data_root is relative to the project folder (where src/ lives), so the project works on any drive/machine. Keep outputs off the monitored volume when a second drive exists; on a single-drive machine the data subtree is auto-excluded from scans to avoid self-stimulation. Edit scope to narrow the scan and speed it up.",
+  "_comment": "CDriveSentinel config. data_root is relative to the project folder (where src/ lives), so the project works on any drive/machine. exclude_paths lists folders that are never scanned (absolute, or relative to the data folder); the tool's own data folder is added automatically when it sits on the monitored volume. data_budget_mb is a hard cap on the tool's own footprint: past it, the oldest history is dropped (archives -> USN detail -> old inventory) instead of growing on a full C:. skip_paths is the legacy name for exclude_paths and is still honoured.",
   "volume": "C:",
   "data_root": ".",
   "scope": [],
@@ -7,15 +7,19 @@
   "snapshot_minutes": 30,
   "window_minutes": 15,
   "top_dir_depth": 3,
-  "max_scan_seconds": 1500,
-  "keep_file_state_snapshots": 2,
-  "keep_snapshot_archives": 4,
+  "max_scan_seconds": 2400,
+  "vacuum_pages_per_snapshot": 20000,
+  "keep_snapshot_archives": 1,
+  "archive_retention_days": 2,
   "archive_mode": "daily",
   "retention_days": 7,
+  "usn_retention_days": 2,
   "keep_usn_polls": 200,
-  "data_size_alert_mb": 1800,
+  "data_size_alert_mb": 800,
+  "data_budget_mb": 800,
   "alert_free_gb_below": 10,
   "alert_growth_gb_per_hour": 2,
+  "exclude_paths": [],
   "skip_paths": [],
   "snapshot_on_alert": true,
   "usn_enabled": true,
@@ -33,5 +37,6 @@
   "wiztree": {
     "exe": "tools/WizTree64.exe",
     "note": "P1 diffs by NTFS file ID; WizTree CSV has no FRN column, so P1 uses the built-in scanner."
-  }
+  },
+  "mft_index_enabled": false
 }

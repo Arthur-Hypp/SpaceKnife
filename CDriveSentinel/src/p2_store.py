@@ -15,7 +15,7 @@ import datetime
 import json
 
 import p1_db as db
-from p1_diff import top_dir
+from p1_diff import is_under, top_dir
 
 DDL = """
 CREATE TABLE IF NOT EXISTS usn_poll (
@@ -116,8 +116,13 @@ class PathResolver:
         self.conn = conn
         self.depth = int(top_dir_depth)
         self.volume_root = volume_root.rstrip("\\/") + "\\"
-        row = conn.execute("SELECT id FROM snapshot_meta ORDER BY id DESC LIMIT 1").fetchone()
-        self.snapshot_id = row["id"] if row else None
+        # L3: there is ONE inventory; runtime_state says which snapshot it
+        # describes. Kept for diagnostics only -- resolve() queries the table
+        # unconditionally, because an empty inventory simply answers nothing.
+        try:
+            self.snapshot_id = int(db.get_state(conn, "inventory.snapshot_id") or 0) or None
+        except (TypeError, ValueError):
+            self.snapshot_id = None
         self._cache = {}
         self._mft_cache = {}
         self.stats = {"snapshot": 0, "history": 0, "mft": 0,
@@ -168,12 +173,11 @@ class PathResolver:
         path = None
         note = ""
 
-        if self.snapshot_id:
-            row = self.conn.execute("""SELECT path FROM file_state
-                WHERE snapshot_id=? AND frn=?""", (self.snapshot_id, frn)).fetchone()
-            if row:
-                path = row["path"]
-                self.stats["snapshot"] += 1
+        # L2: the inventory stores (dir_id, name); path_for_frn joins the
+        # directory table and converts the FRN to its integer key.
+        path = db.path_for_frn(self.conn, frn)
+        if path:
+            self.stats["snapshot"] += 1
         if not path:
             row = self.conn.execute("""SELECT full_path FROM frn_path_map
                 WHERE frn=? ORDER BY valid_from DESC LIMIT 1""", (frn,)).fetchone()
@@ -188,7 +192,12 @@ class PathResolver:
                     path = self.volume_root.rstrip("\\/") + "\\" + path.lstrip("\\/")
         if not path:
             parent = rec.get("parent_frn") or ""
-            parent_path = self._from_mft(parent) if parent else None
+            # L3: the inventory carries a row per DIRECTORY, so the parent
+            # usually resolves there -- no MFT copy needed. mft_index stays as
+            # the second chance for a parent that is already gone.
+            parent_path = db.path_for_frn(self.conn, parent) if parent else None
+            if not parent_path and parent:
+                parent_path = self._from_mft(parent)
             if parent_path:
                 path = parent_path.rstrip("\\") + "\\" + name
                 if not path.lower().startswith(self.volume_root.lower()[:2]):
@@ -244,10 +253,21 @@ INSERT_EVENT = """INSERT INTO usn_event
  VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"""
 
 
-def save_events(conn, poll_id, aggregated, resolver, cfg):
+def save_events(conn, poll_id, aggregated, resolver, cfg, exclude=None):
+    """Persist aggregated USN events.
+
+    *exclude* is the same scan-exclusion list used by the snapshot scanner.
+    USN sees every write on the volume, including the ones this tool makes to
+    its own database and log, so excluding them here is what keeps the
+    "second-level event stream" from being dominated by self-noise.
+    """
     batch = []
+    excluded = 0
     for g in aggregated:
         path, note = resolver.resolve(g)
+        if exclude and is_under(path, exclude):
+            excluded += 1
+            continue
         flags = []
         if g.get("needs_resolution"):
             flags.append("V4 record: name resolved by FRN")
@@ -267,7 +287,9 @@ def save_events(conn, poll_id, aggregated, resolver, cfg):
     if batch:
         conn.executemany(INSERT_EVENT, batch)
     conn.commit()
-    return len(aggregated), dict(resolver.stats)
+    stats = dict(resolver.stats)
+    stats["excluded"] = excluded
+    return len(aggregated) - excluded, stats
 
 
 def link_to_changes(conn):
@@ -373,13 +395,25 @@ def prune_usn(conn, cfg, dry_run=False, batch_rows=50000):
     `change_event` / `diff_run` / `snapshot_meta` / `file_state` belong to P1
     and are pruned by `p1_db.prune()`; this function must not delete them.
     """
-    days = int(cfg.get("retention_days", 7))
+    days = int(cfg.get("usn_retention_days", cfg.get("retention_days", 7)))
     keep_polls = max(1, int(cfg.get("keep_usn_polls", 200)))
     cutoff = (datetime.datetime.now()
               - datetime.timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
     result = {"cutoff": cutoff, "days": days, "dry_run": bool(dry_run),
               "events": 0, "polls": 0, "index_rows": 0, "batches": 0,
-              "keep_polls": keep_polls}
+              "keep_polls": keep_polls, "index_dropped": 0}
+
+    # L3: the inventory now carries a row per DIRECTORY, so an event's parent
+    # FRN resolves from the live file list. What mft_index still buys is the
+    # path of files created and deleted *between* two scans (measured: 532 of
+    # ~7,000 events) -- for 159 MB on this volume. A tool that exists to free
+    # C: should not pay that by default; `mft_index_enabled` opts back in.
+    if not cfg.get("mft_index_enabled", False):
+        held = conn.execute("SELECT COUNT(*) FROM mft_index").fetchone()[0]
+        if held and not dry_run:
+            conn.execute("DELETE FROM mft_index")
+            conn.commit()
+        result["index_dropped"] = 0 if dry_run else held
 
     if dry_run:
         result["events"] = conn.execute(

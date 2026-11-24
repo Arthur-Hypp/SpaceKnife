@@ -22,7 +22,7 @@ C 盘空间变化实时监测与归因工具集。回答一个问题：**C 盘�
 - **USN 事件流**：直读 USN Journal（V2/V3/V4），秒级时间与操作原因，按 FRN 关联快照事件升级置信度；瞬态事件单列，不注入字节账本。
 - **日报与告警**：每日 txt/HTML 报告、门户页，磁盘余量与增长速度告警。
 - **零第三方依赖**：Python 3.7+ 标准库（`ctypes` / `sqlite3` / `gzip` / `csv`），无需 pip 安装任何包。
-- **可移植**：数据目录默认相对项目文件夹解析；有第二块盘时自动把数据放过去；真单盘机器会落到监控盘的专用子目录并从扫描中排除，避免自激。
+- **可移植**：程序与数据分离——安装版数据在 `%PROGRAMDATA%\CDriveSentinel`，源码运行在项目文件夹，放一个 `portable.txt` 则回到 exe 旁的绿色版布局；数据若在监控卷上会自动排除该子树，避免自激。
 
 ## 平台与权限
 
@@ -38,7 +38,11 @@ python src\main.py init-db       # 建库 + 首个心跳
 python src\main.py snapshot      # 手动跑一次快照 + 差分
 python src\main.py daemon        # 常驻：心跳 / USN / 快照 / 日报
 python src\main.py report --day 2026-11-20 --top 20   # 生成某天日报
-python src\main.py status        # 数据库概况
+python src\main.py status        # 数据库概况（含控制通道状态）
+python src\main.py paths         # 程序 / 数据 / 配置实际落点
+python src\main.py scan-now      # 请求守护进程立刻扫一次（不需管理员）
+python src\main.py pause         # 暂停调度（正在跑的扫描会中止）
+python src\main.py resume        # 恢复调度
 python src\main.py selftest      # 端到端自检（只读沙箱，不碰 C:）
 python src\main.py usn-status    # USN 权限 / journal / 游标诊断
 ```
@@ -47,6 +51,18 @@ python src\main.py usn-status    # USN 权限 / journal / 游标诊断
 
 将守护进程注册为开机计划任务（需管理员）：`powershell -ExecutionPolicy Bypass -File .\install_task.ps1`（卸载加 `-Uninstall`）。
 
+### 控制通道（托盘 ↔ 守护进程）
+
+托盘界面：`python gui\tray.py`（`--window` 启动即展开面板，`--smoke` 自检）。界面只读数据库，**只写 `runtime/`**，不需要管理员权限。
+
+```json
+{ "paused": false, "request_scan": 1799999999.0, "by": "tray" }
+```
+
+- 请求用持久化的 `runtime.last_scan_request` 消费，**守护进程重启不会重放旧点击**。
+- 暂停会让正在跑的扫描在数秒内中止，快照如实标记为 `PARTIAL(cancelled)`，并且**不会**成为下次差分的基线。
+- 界面与守护进程必须指向同一数据目录，否则便条写到了没人看的地方。
+
 ## 配置
 
 编辑 `CDriveSentinel/config/config.json`。常用项：
@@ -54,13 +70,22 @@ python src\main.py usn-status    # USN 权限 / journal / 游标诊断
 | 字段 | 含义 |
 |---|---|
 | `volume` | 监控卷，默认 `C:` |
-| `data_root` | 数据目录，相对项目文件夹解析，默认 `.` |
+| `data_root` | 数据目录，相对「数据根」解析（安装版为 `%PROGRAMDATA%\CDriveSentinel`，源码运行为项目文件夹），默认 `.` |
 | `scope` | 扫描范围，空数组表示整卷 |
+| `exclude_paths` | 永不扫描的目录列表（绝对路径，或相对「数据根」）。数据目录若在监控卷上会自动加入；写进去的目录既不参与快照扫描，也不会进 USN 事件流 |
+| `skip_paths` | `exclude_paths` 的旧名字，仍然生效（两者合并使用） |
 | `snapshot_minutes` / `heartbeat_seconds` / `usn_poll_seconds` | 调度间隔 |
+| `max_scan_seconds` | 单次全盘扫描的时间预算（默认 2400）。**必须大于真实扫描时长**：超时的扫描在 L3 下不落库（partial 不能当基线），等于这个窗口没有数据。换机器后先看 `run.log` 里的 `elapsed`，乘 1.5 设定 |
+| `data_budget_mb` | **自身占盘硬上限**（默认 800）。超出时自动按「损失最小的先砍」收缩：旧归档 → USN 明细 → 可重建索引 → 清单 → 账本；`0` 关闭 |
+| `usn_retention_days` | USN 事件明细保留天数（默认 2）。报告只需要聚合数字，不需要 7 天逐条 |
+| `archive_retention_days` | 每日 gzip 归档保留天数（默认 2）。清单和账本已覆盖当前状态与每次变化，归档只是给外部工具的时间点副本 |
+| `mft_index_enabled` | 是否保留完整 MFT 索引（默认 `false`）。清单现在含目录行，父目录路径可直接解析；这份索引只在「两次扫描之间生灭的文件」上有用，实测为此花掉 159 MB |
 | `alert_free_gb_below` / `alert_growth_gb_per_hour` | 告警阈值 |
 | `daily_report_hour` / `daily_report_top` | 日报生成时间与 Top N |
 
-**重要**：所有产物必须避开监控卷。有第二块盘时程序会自动把 `data_root` 迁过去；单盘时数据落在监控盘的 `CDriveSentinelData/` 子目录并从扫描中排除。
+**占盘说明**：清单（`file_state`）只存 `(目录 id, 文件名)`，实测 **57 B/行**；目录字符串单独存一份 `dir_path`（已去掉 UNIQUE 索引，省 38 MB）。从 L3 起只有**一份**清单：扫描先把结果写进 `scan_stage`，扫完再原地合并进 `file_state`，因此 1.23M 行（103 万文件 + 20 万目录）约 86 MB，而不是原先两份的 205 MB。清单同时记录每个目录的 FRN，父目录路径不再需要 `mft_index`——这砍掉了 159 MB。实测：存活数据约 **400 MB**，加上归档与日志约 **450 MB**；扫描期间暂存区会让数据库文件临时多出约 80 MB 空闲页，每轮 `reclaim` 归还，1–2 轮内归零。用 `python src\main.py status` 可看到实时占用与 `reclaimable` 拆分；`maintenance` 做一次完整收缩（**需先停掉守护进程**，VACUUM 要排他锁）。要继续压体积只能缩短历史：USN 明细 2→1 天（−92 MB）、账本 7→3 天（−55 MB）、关掉 `frn_path_map`（−30 MB）、归档 2→1 天（−20 MB），四项全开约 250 MB。
+
+**重要**：所有产物应避开监控卷。源码运行时有第二块盘会自动把 `data_root` 迁过去，单盘时落到监控盘的 `CDriveSentinelData/`；安装版固定使用 `%PROGRAMDATA%\CDriveSentinel`，若它在监控卷上则整目录排除扫描。排除清单属于扫描范围的一部分：改动它会开启一个新的基线，因此不会把被排除目录里的历史文件误报成"删除"。
 
 ## 打包为独立 exe（Windows）
 
@@ -80,8 +105,12 @@ CDriveSentinel.exe daemon
 CDriveSentinel.exe selftest
 ```
 
-- 采用 onedir 模式，配置与数据都在 exe 旁边：首次运行自动生成 `config/config.json`（可编辑），数据写入 `data/`（或自动迁到非监控盘）。
-- 把守护进程注册为开机计划任务（需管理员）：在 `dist/CDriveSentinel/` 内运行 `powershell -ExecutionPolicy Bypass -File .\install_task.ps1`；卸载加 `-Uninstall`。脚本会自动识别 exe 版并以无窗口方式运行。
+- 采用 onedir 模式。**程序与数据分离**：安装后程序在 `C:\Program Files\CDriveSentinel\`，配置与数据在 `%PROGRAMDATA%\CDriveSentinel\`（首次运行自动生成 `config\config.json`，可编辑）。
+- 源码运行不受影响：配置与数据仍然写在项目文件夹内，路径与以前完全一致。
+- 想做成"绿色版"（数据随程序走）：在 `CDriveSentinel.exe` 同目录放一个空的 `portable.txt`，数据就会退回 exe 旁边的 `config\`、`data\`。
+- 数据目录若落在被监控的卷上（典型是只有 C: 单盘的笔记本），该子树会被扫描排除，避免把工具自身的写入算成 C 盘增长。
+- 查看当前实际使用的目录：`CDriveSentinel.exe paths`。
+- 把守护进程注册为开机计划任务（需管理员）：在 exe 目录内运行 `powershell -ExecutionPolicy Bypass -File .\install_task.ps1`；卸载加 `-Uninstall`。脚本会自动识别 exe 版并以无窗口方式运行。
 - `CDriveSentinel.spec` / `build.py` 为构建配置；不需要的第三方模块已在 spec 中排除，未启用 UPX 压缩以避免杀毒误报。
 
 ## 代码签名（SignPath Foundation）

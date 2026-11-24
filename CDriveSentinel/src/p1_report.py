@@ -13,7 +13,17 @@ import datetime
 import html
 import json
 
-from p1_diff import top_dir
+import p1_config as config
+import p1_db as db
+from p1_diff import top_dir, top_dir_of
+
+
+def _data_location() -> str:
+    """Where outputs actually live -- differs between source and installed runs."""
+    try:
+        return str(config.data_dir())
+    except Exception:
+        return "项目文件夹"
 
 
 def human(num):
@@ -115,10 +125,12 @@ def build_report_data(conn, cfg, day=None, since=None, until=None, top=10):
             "scan": scan,
         })
 
-    # A snapshot_meta row is inserted at scan START with NULL file_count and
-    # filled at scan END. Reading the newest row regardless of completion made
-    # the "current occupancy" table show only the directories scanned so far
-    # (e.g. 3 GiB WinSxS only). Use the newest COMPLETED snapshot instead.
+    # L3: there is one inventory and it describes the newest merged scan, so
+    # the "current occupancy" table reads it directly. (Reading the newest
+    # snapshot_meta row instead used to be wrong twice: at scan START its
+    # file_count is NULL, and a scan that was never merged is not what the
+    # inventory holds.)
+    inv = db.inventory_info(conn)
     latest = conn.execute(
         "SELECT * FROM snapshot_meta WHERE file_count IS NOT NULL "
         "ORDER BY id DESC LIMIT 1").fetchone()
@@ -126,13 +138,17 @@ def build_report_data(conn, cfg, day=None, since=None, until=None, top=10):
         "SELECT id, ts_local FROM snapshot_meta WHERE file_count IS NULL "
         "ORDER BY id DESC LIMIT 1").fetchone()
     current_top = []
-    if latest and latest["id"]:
+    if inv["rows"]:
         depth = int(cfg.get("top_dir_depth", 3))
         agg = {}
-        for row in conn.execute("""SELECT path, allocated_size FROM file_state
-                WHERE snapshot_id=?""", (latest["id"],)):
-            key = top_dir(row["path"], depth)
-            agg[key] = agg.get(key, 0) + (row["allocated_size"] or 0)
+        # Aggregate by directory inside SQL and roll up to top_dir in Python:
+        # the inventory stores (dir_id, name), so joining dir_path once is both
+        # cheaper than rebuilding a million paths and exactly as accurate.
+        for row in conn.execute("""SELECT d.path AS dir, SUM(f.allocated_size) AS total
+                FROM file_state f JOIN dir_path d ON d.id = f.dir_id
+                GROUP BY f.dir_id"""):
+            key = top_dir_of(row["dir"], depth)
+            agg[key] = agg.get(key, 0) + (row["total"] or 0)
         current_top = [{"path": k, "bytes": v} for k, v in
                        sorted(agg.items(), key=lambda kv: kv[1], reverse=True)[:top]]
 
@@ -351,7 +367,7 @@ def render_text(data):
     add("      数值与 WizTree 或 P0 报告可能略有差异，但卷总量与差分增量不受影响。")
     add("P2：USN 记录按 FRN 关联，命中的快照事件升级为 evidence=usn+snapshot /")
     add("      confidence=high 并补齐 reason_mask 与精确 UTC 时间；瞬态事件单列展示。")
-    add("只读：本系统不创建、修改、删除被监控卷上的任何文件；所有数据写入独立的数据目录（默认位于项目文件夹，可配置）。")
+    add("只读：本系统不创建、修改、删除被监控卷上的任何文件；所有数据写入独立的数据目录（%s，可用 data_root 调整）。" % _data_location())
     add("=" * 78)
     return "\n".join(L) + "\n"
 
@@ -552,7 +568,7 @@ code{background:#f3f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
                 (e(a["ts_local"]), e(a["kind"]), e(a["message"])))
         add("</table>")
 
-    add("<h2>口径与约束</h2><div class='note'>分配大小（簇对齐；压缩/稀疏用 GetCompressedFileSizeW）、硬链接按 NTFS 文件 ID 只计一次并归属到枚举时首个路径（故 WinSxS / System32 的目录级数值可能与 WizTree 或 P0 报告略有差异，卷总量与差分增量不受影响）、快照按 FRN 对齐（重命名记 RENAME 且 delta=0）。<br>本系统只读：不创建、修改、删除被监控卷上的任何文件；所有数据写入独立的数据目录（默认位于项目文件夹，可配置）。<br>P1 快照事件默认 evidence=snapshot / confidence=medium；P2 用 USN 按 FRN 关联后升级为 usn+snapshot / high，并补齐 reason_mask 与精确 UTC 时间；两次快照之间的瞬态事件单独列出，不写入空间账本。</div>")
+    add("<h2>口径与约束</h2><div class='note'>分配大小（簇对齐；压缩/稀疏用 GetCompressedFileSizeW）、硬链接按 NTFS 文件 ID 只计一次并归属到枚举时首个路径（故 WinSxS / System32 的目录级数值可能与 WizTree 或 P0 报告略有差异，卷总量与差分增量不受影响）、快照按 FRN 对齐（重命名记 RENAME 且 delta=0）。<br>本系统只读：不创建、修改、删除被监控卷上的任何文件；所有数据写入独立的数据目录（' + html.escape(_data_location()) + '）。<br>P1 快照事件默认 evidence=snapshot / confidence=medium；P2 用 USN 按 FRN 关联后升级为 usn+snapshot / high，并补齐 reason_mask 与精确 UTC 时间；两次快照之间的瞬态事件单独列出，不写入空间账本。</div>")
     add("<div class='meta'>CDriveSentinel P1 · 报告数据：data/sentinel.db · 逐事件日志：data/logs/YYYY-MM-DD.jsonl</div>")
     add("""<script>
 document.addEventListener('click', function(ev) {

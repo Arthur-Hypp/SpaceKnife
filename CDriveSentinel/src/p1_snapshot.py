@@ -14,6 +14,9 @@ Key implementation notes (learned from P0 on this machine):
   * Hard links are deduplicated by file index, so WinSxS is not inflated.
   * A time budget produces an explicitly PARTIAL snapshot; partial snapshots
     are stored but never used as a diff baseline (see p1_diff).
+  * ``exclude_roots`` prunes whole subtrees before any stat() call. The list
+    is built by ``p1_config.exclude_prefixes()`` and always contains the
+    tool's own data folder when that folder sits on the monitored volume.
 
 No third-party dependencies. Nothing on the scanned volume is written.
 """
@@ -43,17 +46,26 @@ def _utc_iso(timestamp: float) -> str:
 class FileScanner:
     """Iterative, timeout-aware, read-only enumeration of a set of roots."""
 
-    def __init__(self, roots, max_seconds=900.0, progress=None, exclude_roots=None):
+    def __init__(self, roots, max_seconds=900.0, progress=None, exclude_roots=None,
+                 should_stop=None):
         self.roots = [os.path.abspath(r) for r in roots]
-        # Normalised lowercase prefixes that must never be enumerated. Used in
-        # the single-drive fallback to keep this tool's own data out of the
-        # snapshot (otherwise writing a log would look like volume growth).
-        self.exclude_roots = [
+        # Normalised lowercase prefixes that must never be enumerated. The
+        # list comes from p1_config.exclude_prefixes() (own data folder +
+        # exclude_paths + legacy skip_paths). Excluding at enumeration time --
+        # rather than filtering afterwards -- is the point: skipped folders
+        # cost no os.scandir() and no os.stat() at all.
+        self.exclude_roots = sorted({
             os.path.abspath(str(r)).rstrip("\\/").lower()
-            for r in (exclude_roots or [])
-        ]
+            for r in (exclude_roots or []) if str(r).strip()
+        })
         self.max_seconds = float(max_seconds)
         self.progress = progress
+        # Optional abort hook, checked once per directory (same cadence as the
+        # time budget). Used by the daemon so "pause" takes effect in seconds
+        # instead of after a 25-minute full scan. A stopped scan is stored as
+        # PARTIAL and therefore never becomes a diff baseline.
+        self.should_stop = should_stop
+        self.cancelled = False
         self.cluster = cluster_size(self.roots[0]) if self.roots else 4096
         self.started = time.monotonic()
         self.deadline = self.started + self.max_seconds
@@ -67,6 +79,7 @@ class FileScanner:
             "access_denied": 0,
             "other_errors": 0,
             "frn_unavailable": 0,
+            "excluded_skipped": 0,
         }
         self.errors_sample = []
         self._seen = set()
@@ -92,6 +105,7 @@ class FileScanner:
         return {
             "counters": dict(self.counters),
             "partial": self.partial,
+            "cancelled": self.cancelled,
             "elapsed_seconds": self.elapsed_seconds,
             "cluster_size": self.cluster,
             "errors_sample": self.errors_sample,
@@ -99,17 +113,59 @@ class FileScanner:
             "key_basis": "NTFS file index (os.stat st_ino), path-hash fallback",
         }
 
+    def _should_abort(self) -> bool:
+        """Per-directory gate: time budget or an explicit stop request."""
+        if self.should_stop is not None:
+            try:
+                if self.should_stop():
+                    self.cancelled = True
+                    self.partial = True
+                    return True
+            except Exception:
+                self.should_stop = None      # a broken hook must not stop us
+        if time.monotonic() > self.deadline:
+            self.partial = True
+            return True
+        return False
+
+    def _dir_key(self, path):
+        """FRN of a directory (hex text), or None when it is unavailable."""
+        try:
+            ino = getattr(os.stat(path, follow_symlinks=False), "st_ino", 0)
+        except OSError:
+            return None
+        return ("0x%016x" % ino) if ino else None
+
     def rows(self):
         """Yield dict rows; returns early (partial=True) when the budget ends."""
         count = self.counters
         for root in self.roots:
-            stack = [root.rstrip("\\/") + "\\"]
+            base = root.rstrip("\\/") + "\\"
+            stack = [(base, self._dir_key(base))]
             while stack:
-                if time.monotonic() > self.deadline:
-                    self.partial = True
+                if self._should_abort():
                     return
-                current = stack.pop()
+                current, dir_frn = stack.pop()
                 count["dirs"] += 1
+                # Directories are inventory rows too (L3). They carry no bytes,
+                # so they never produce change events, but keeping FRN ->
+                # (parent, name) in the live inventory is what lets a USN event
+                # resolve its parent directory without a 159 MB copy of the
+                # whole MFT (mft_index). Cost here: ~150k rows, ~10 MB.
+                if dir_frn:
+                    path = current.rstrip("\\/")
+                    if len(path) > 2:          # skip the volume root itself
+                        yield {
+                            "frn": dir_frn,
+                            "parent_frn": None,
+                            "name": None,
+                            "path": path,
+                            "logical_size": 0,
+                            "allocated_size": 0,
+                            "mtime_utc": "",
+                            "attributes": 0,
+                            "is_dir": 1,
+                        }
                 try:
                     with os.scandir(current) as it:
                         for entry in it:
@@ -117,9 +173,10 @@ class FileScanner:
                                 self.partial = True
                                 return
                             child = entry.path
-                            # Single-drive fallback: never enumerate the
-                            # tool's own data subtree (avoids self-stimulation).
+                            # Excluded subtrees are skipped before any stat
+                            # call: no permission prompt, no directory read.
                             if self.exclude_roots and self._excluded(child):
+                                count["excluded_skipped"] += 1
                                 continue
                             try:
                                 if entry.is_dir(follow_symlinks=False):
@@ -130,7 +187,19 @@ class FileScanner:
                                     if dattr & FILE_ATTRIBUTE_REPARSE_POINT:
                                         count["reparse_points_skipped"] += 1
                                         continue
-                                    stack.append(child)
+                                    # On Windows the dirent cache carries no
+                                    # file id (st_ino == 0), so the FRN needs a
+                                    # real stat. ~150k extra stats on a full
+                                    # volume, against saving a 159 MB MFT copy.
+                                    ino = getattr(dstat, "st_ino", 0) or 0
+                                    if not ino:
+                                        try:
+                                            ino = getattr(os.stat(
+                                                child, follow_symlinks=False),
+                                                "st_ino", 0) or 0
+                                        except OSError:
+                                            ino = 0
+                                    stack.append((child, ("0x%016x" % ino) if ino else None))
                                     continue
 
                                 try:

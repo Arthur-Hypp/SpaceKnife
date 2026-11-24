@@ -1,0 +1,927 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""CDriveSentinel tray + dashboard -- M1-4/M1-5.
+
+    python gui/tray.py                 # run normally (tray + window)
+    python gui/tray.py --shot out.png  # offscreen render for review (dev only)
+    python gui/tray.py --window        # start with the panel shown
+
+Scope (deliberate):
+  * Reads the live database through ``gui/datafeed.py`` (read-only).
+  * Shows: free space, today's net change, last snapshot, USN state,
+    today's top-10 growing directories, recent alerts, 7-day trend.
+  * Tray: status icon, tooltip, menu, close-to-tray, single instance.
+  * M1-5 command channel: 立即扫描 / 暂停 write ``<data>/runtime/state.json``
+    through ``gui/control_client.py`` and poke a named event. The UI never
+    opens the database for writing and never needs administrator rights; the
+    elevated daemon is the only process that reads the volume.
+"""
+from __future__ import annotations
+
+import datetime as dt
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from PySide6.QtCore import (QObject, QRectF, QRunnable, QSharedMemory, Qt,
+                            QThreadPool, QTimer, QUrl, Signal)
+from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QIcon,
+                           QPainter, QPen, QPixmap)
+from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QMenu,
+                               QMessageBox, QPushButton, QSizePolicy,
+                               QSystemTrayIcon, QVBoxLayout, QWidget)
+
+import control_client
+import datafeed
+
+NOTE_DEFAULT = "只读监控 · 界面只写 runtime/，从不写库"
+
+# ------------------------------------------------------------------ palette
+
+BG = "#F4F5F7"
+CARD = "#FFFFFF"
+BORDER = "#E6E8EC"
+TEXT = "#1D2129"
+SUB = "#6B7280"
+MUT = "#9AA0A6"
+ACCENT = "#2563EB"
+RED = "#D64545"        # 增长用红色（符合国内习惯：涨=红）
+GREEN = "#2E9E67"
+AMBER = "#C2760B"
+
+STATE_STYLE = {
+    "running":  ("运行中", "#E9F6EF", "#1E7B4D", GREEN),
+    "scanning": ("正在扫描", "#E8F0FE", "#1D4ED8", ACCENT),
+    "paused":   ("已暂停", "#FDF3E3", "#8A5A00", AMBER),
+    "stale":    ("已停止", "#FDF3E3", "#9A5B00", AMBER),
+    "error":    ("读取失败", "#FDECEC", "#B3261E", RED),
+    "unknown":  ("等待数据", "#F1F2F4", "#5F6670", "#8A9099"),
+}
+
+QSS = """
+QWidget { color: %(text)s; }
+QWidget#root { background: %(bg)s; }
+QFrame#card { background: %(card)s; border: 1px solid %(border)s; border-radius: 12px; }
+QLabel#cardTitle { color: %(text)s; font-size: 14px; }
+QLabel#hint { color: %(mut)s; font-size: 12px; }
+QPushButton#primary {
+    background: %(accent)s; color: #FFFFFF; border: none;
+    border-radius: 8px; padding: 8px 18px; font-size: 13px;
+}
+QPushButton#primary:hover { background: #1D4ED8; }
+QPushButton#primary:pressed { background: #1E40AF; }
+QPushButton#primary:disabled { background: #C6CBD2; color: #F7F8FA; }
+QPushButton#ghost {
+    background: %(card)s; color: %(text)s; border: 1px solid #D9DDE3;
+    border-radius: 8px; padding: 8px 14px; font-size: 13px;
+}
+QPushButton#ghost:hover { background: #F2F4F7; }
+QPushButton#ghost:pressed { background: #E9ECF1; }
+QMenu { background: %(card)s; border: 1px solid %(border)s; padding: 6px; }
+QMenu::item { padding: 7px 26px 7px 14px; border-radius: 6px; font-size: 13px; }
+QMenu::item:selected { background: #EFF4FF; color: #1D4ED8; }
+QMenu::separator { height: 1px; background: %(border)s; margin: 5px 8px; }
+QToolTip { background: #2B2F36; color: #FFFFFF; border: none; padding: 6px 8px; }
+""" % {"text": TEXT, "bg": BG, "card": CARD, "border": BORDER,
+       "mut": MUT, "accent": ACCENT}
+
+
+# ------------------------------------------------------------------ icons
+
+def make_pixmap(state: str = "running", size: int = 64, usage: float = 0.0) -> QPixmap:
+    """A disk ring whose fill = usage, whose colour = daemon state."""
+    color = QColor(STATE_STYLE.get(state, STATE_STYLE["unknown"])[3])
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+
+    pad = size * 0.16
+    rect = QRectF(pad, pad, size - 2 * pad, size - 2 * pad)
+    track = QPen(QColor(color.red(), color.green(), color.blue(), 46), size * 0.11)
+    track.setCapStyle(Qt.RoundCap)
+    p.setPen(track)
+    p.drawEllipse(rect)
+
+    arc = QPen(color, size * 0.11)
+    arc.setCapStyle(Qt.RoundCap)
+    p.setPen(arc)
+    span = -360 * max(0.04, min(1.0, usage)) if usage else -360
+    p.drawArc(rect, 90 * 16, int(span * 16))
+
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    d = size * 0.14
+    p.drawEllipse(QRectF(size / 2 - d / 2, size / 2 - d / 2, d, d))
+    p.end()
+    return pm
+
+
+def make_icon(state: str = "running", usage: float = 0.0) -> QIcon:
+    icon = QIcon()
+    for s in (16, 24, 32, 48, 64):
+        icon.addPixmap(make_pixmap(state, s, usage))
+    return icon
+
+
+# ------------------------------------------------------------------ tiny widgets
+
+class ElidedLabel(QLabel):
+    """QLabel that shortens itself with … instead of forcing the layout wide."""
+
+    def __init__(self, text: str = "", mode=Qt.ElideRight, parent=None):
+        super().__init__(parent)
+        self._full = text
+        self._mode = mode
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._apply()
+
+    def setText(self, text: str) -> None:      # noqa: N802 (Qt naming)
+        self._full = text or ""
+        self._apply()
+
+    def fullText(self) -> str:                 # noqa: N802
+        return self._full
+
+    def resizeEvent(self, event):              # noqa: N802
+        super().resizeEvent(event)
+        self._apply()
+
+    def _apply(self) -> None:
+        fm = QFontMetrics(self.font())
+        QLabel.setText(self, fm.elidedText(self._full, self._mode, max(24, self.width())))
+
+
+class MetricCard(QFrame):
+    def __init__(self, title: str, parent=None):
+        super().__init__(parent)
+        self.setObjectName("card")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(16, 13, 16, 13)
+        lay.setSpacing(5)
+
+        top = QHBoxLayout()
+        top.setSpacing(6)
+        cap = QLabel(title)
+        cap.setStyleSheet("color:%s; font-size:12px;" % SUB)
+        self.badge = QLabel("")
+        self.badge.setVisible(False)
+        top.addWidget(cap)
+        top.addStretch(1)
+        top.addWidget(self.badge)
+
+        self.value = QLabel("--")
+        f = QFont(self.value.font())
+        f.setPixelSize(23)
+        f.setWeight(QFont.DemiBold)
+        self.value.setFont(f)
+        self.value.setStyleSheet("color:%s;" % TEXT)
+
+        self.sub = ElidedLabel("")
+        self.sub.setStyleSheet("color:%s; font-size:12px;" % MUT)
+
+        lay.addLayout(top)
+        lay.addWidget(self.value)
+        lay.addWidget(self.sub)
+
+    def set(self, value: str, sub: str = "", color: str = TEXT, badge: str = "") -> None:
+        self.value.setText(value)
+        self.value.setStyleSheet("color:%s;" % color)
+        self.sub.setText(sub)
+        if badge:
+            self.badge.setText(badge)
+            self.badge.setStyleSheet(
+                "background:#FDECEC; color:#B3261E; font-size:11px;"
+                "border-radius:9px; padding:2px 8px;")
+            self.badge.setVisible(True)
+        else:
+            self.badge.setVisible(False)
+
+
+class TopList(QWidget):
+    """Hand-painted rows: name / proportional bar / bytes. Avoids 30 widgets."""
+
+    ROW = 38
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.items = []
+        self.setMinimumHeight(self.ROW * 4)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_items(self, items) -> None:
+        self.items = list(items)
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w = self.width()
+
+        if not self.items:
+            p.setPen(QColor(MUT))
+            f = QFont(self.font())
+            f.setPixelSize(12)
+            p.setFont(f)
+            p.drawText(self.rect(), Qt.AlignCenter, "今天还没有归因事件")
+            return
+
+        name_font = QFont(self.font())
+        name_font.setPixelSize(13)
+        val_font = QFont(self.font())
+        val_font.setPixelSize(13)
+        sub_font = QFont(self.font())
+        sub_font.setPixelSize(11)
+
+        top = max((i.delta for i in self.items), default=1) or 1
+        row_h = min(46.0, max(30.0, self.height() / max(1, len(self.items))))
+        bar_x = w - 246
+        bar_w = 150.0
+        text_w = max(80, bar_x - 12)
+
+        for idx, item in enumerate(self.items):
+            y = idx * row_h
+            p.setFont(name_font)
+            p.setPen(QColor(TEXT))
+            name = QFontMetrics(name_font).elidedText(item.path, Qt.ElideMiddle, int(text_w))
+            p.drawText(QRectF(0, y, text_w, row_h), Qt.AlignVCenter | Qt.AlignLeft, name)
+
+            by = y + row_h / 2 - 3
+            p.setPen(Qt.NoPen)
+            p.setBrush(QColor("#EFF1F4"))
+            p.drawRoundedRect(QRectF(bar_x, by, bar_w, 6), 3, 3)
+            frac = float(item.delta) / float(top)
+            p.setBrush(QColor(RED))
+            p.drawRoundedRect(QRectF(bar_x, by, max(4.0, bar_w * frac), 6), 3, 3)
+
+            p.setFont(val_font)
+            p.setPen(QColor(RED))
+            p.drawText(QRectF(w - 84, y, 84, row_h / 2 + 2),
+                       Qt.AlignRight | Qt.AlignBottom, datafeed.size(item.delta))
+            p.setFont(sub_font)
+            p.setPen(QColor(MUT))
+            p.drawText(QRectF(w - 84, y + row_h / 2, 84, row_h / 2 - 6),
+                       Qt.AlignRight | Qt.AlignTop, "%s 条事件" % format(item.events, ","))
+
+
+class Sparkline(QWidget):
+    """7-day net change: red bars up, green bars down, zero line in between."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.data = []
+        self.setMinimumHeight(112)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+    def set_data(self, data) -> None:
+        self.data = list(data)
+        self.update()
+
+    def paintEvent(self, event):  # noqa: N802
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        label_h = 18
+
+        if not self.data or all(v == 0 for _, v in self.data):
+            p.setPen(QColor(MUT))
+            f = QFont(self.font())
+            f.setPixelSize(12)
+            p.setFont(f)
+            p.drawText(self.rect(), Qt.AlignCenter, "暂无足够数据")
+            return
+
+        values = [v for _, v in self.data]
+        max_up = max([v for v in values if v > 0] + [1])
+        max_dn = max([-v for v in values if v < 0] + [1])
+        has_neg = any(v < 0 for v in values)
+
+        plot_top, plot_bottom = 8.0, h - label_h - 6
+        plot_h = plot_bottom - plot_top
+        zero_y = plot_top + (plot_h * 0.62 if has_neg else plot_h)
+
+        pen = QPen(QColor("#E3E6EA"), 1)
+        p.setPen(pen)
+        p.drawLine(int(0), int(zero_y), int(w), int(zero_y))
+
+        n = len(self.data)
+        slot = w / n
+        bar_w = min(26.0, slot * 0.46)
+        day_font = QFont(self.font())
+        day_font.setPixelSize(10)
+
+        for i, (day, value) in enumerate(self.data):
+            cx = slot * (i + 0.5)
+            if value >= 0:
+                bh = (value / max_up) * (zero_y - plot_top) if max_up else 0
+                bh = max(bh, 2.0) if value else 0
+                p.setBrush(QColor(RED))
+                p.setPen(Qt.NoPen)
+                p.drawRoundedRect(QRectF(cx - bar_w / 2, zero_y - bh, bar_w, bh), 2, 2)
+            else:
+                bh = (-value / max_dn) * (plot_bottom - zero_y) if max_dn else 0
+                bh = max(bh, 2.0)
+                p.setBrush(QColor(GREEN))
+                p.setPen(Qt.NoPen)
+                p.drawRoundedRect(QRectF(cx - bar_w / 2, zero_y, bar_w, bh), 2, 2)
+
+            p.setFont(day_font)
+            p.setPen(QColor(MUT))
+            label = "%d/%d" % (int(day[5:7]), int(day[8:10])) if len(day) >= 10 else day
+            p.drawText(QRectF(cx - slot / 2, plot_bottom + 3, slot, label_h),
+                       Qt.AlignHCenter | Qt.AlignTop, label)
+
+        p.setFont(day_font)
+        p.setPen(QColor(MUT))
+        p.drawText(QRectF(0, 0, 120, 14), Qt.AlignLeft | Qt.AlignTop,
+                   "今日 %s" % datafeed.size(values[-1], True))
+
+
+class StatusPill(QLabel):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        f = QFont(self.font())
+        f.setPixelSize(12)
+        self.setFont(f)
+        self.set_state("unknown")
+
+    def set_state(self, state: str) -> None:
+        text, bg, fg, _ = STATE_STYLE.get(state, STATE_STYLE["unknown"])
+        self.setText("●  " + text)
+        self.setStyleSheet(
+            "background:%s; color:%s; border-radius:11px; padding:4px 12px;" % (bg, fg))
+
+
+# ------------------------------------------------------------------ loading
+
+class Bridge(QObject):
+    loaded = Signal(object)
+    failed = Signal(str)
+
+
+class LoadJob(QRunnable):
+    def __init__(self, db, bridge: Bridge):
+        super().__init__()
+        self.db = db
+        self.bridge = bridge
+
+    def run(self) -> None:
+        try:
+            dash = datafeed.load(self.db)
+        except Exception as exc:                     # noqa: BLE001 - never kill the UI
+            self.bridge.failed.emit(str(exc))
+            return
+        self.bridge.loaded.emit(dash)
+
+
+# ------------------------------------------------------------------ window
+
+class Dashboard(QWidget):
+    def __init__(self, tray: "TrayController | None" = None):
+        super().__init__()
+        self.setObjectName("root")
+        self.setWindowTitle("C 盘哨兵 · CDriveSentinel")
+        self.setWindowIcon(make_icon("running"))
+        self.resize(1040, 720)
+        self.setMinimumSize(940, 640)
+
+        self.tray = tray
+        self.dash: datafeed.Dashboard | None = None
+        self._loading = False
+        self._bridge = Bridge(self)
+        self._bridge.loaded.connect(self._on_loaded)
+        self._bridge.failed.connect(self._on_failed)
+        self._pool = QThreadPool(self)
+        self._pool.setMaxThreadCount(1)
+
+        self._build()
+        self.refresh()
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(15000)
+        self._timer.timeout.connect(self.refresh)
+        self._timer.start()
+
+    # ---------------- layout
+    def _build(self) -> None:
+        root = QVBoxLayout(self)
+        root.setContentsMargins(20, 18, 20, 16)
+        root.setSpacing(14)
+
+        # header
+        head = QHBoxLayout()
+        head.setSpacing(12)
+        logo = QLabel()
+        logo.setPixmap(make_pixmap("running", 40, 0.89))
+        logo.setFixedSize(40, 40)
+        self.logo = logo
+        head.addWidget(logo)
+
+        titles = QVBoxLayout()
+        titles.setSpacing(1)
+        name = QLabel("C 盘哨兵")
+        f = QFont(name.font())
+        f.setPixelSize(18)
+        f.setWeight(QFont.DemiBold)
+        name.setFont(f)
+        self.subtitle = ElidedLabel("C: 只读监控 · 正在读取…")
+        self.subtitle.setStyleSheet("color:%s; font-size:12px;" % SUB)
+        titles.addWidget(name)
+        titles.addWidget(self.subtitle)
+        head.addLayout(titles, 1)
+
+        self.pill = StatusPill()
+        head.addWidget(self.pill, 0, Qt.AlignVCenter)
+        root.addLayout(head)
+
+        # metric cards
+        cards = QHBoxLayout()
+        cards.setSpacing(12)
+        self.card_free = MetricCard("可用空间")
+        self.card_today = MetricCard("今日净增")
+        self.card_snap = MetricCard("最近快照")
+        self.card_usn = MetricCard("USN 事件流")
+        for c in (self.card_free, self.card_today, self.card_snap, self.card_usn):
+            cards.addWidget(c, 1)
+        root.addLayout(cards)
+
+        # body
+        body = QHBoxLayout()
+        body.setSpacing(12)
+
+        left = QFrame()
+        left.setObjectName("card")
+        ll = QVBoxLayout(left)
+        ll.setContentsMargins(16, 14, 16, 12)
+        ll.setSpacing(8)
+        lhead = QHBoxLayout()
+        lt = QLabel("今日增长 Top 10")
+        lt.setObjectName("cardTitle")
+        lsub = QLabel("按一级目录聚合")
+        lsub.setObjectName("hint")
+        self.top_hint = lsub
+        lhead.addWidget(lt)
+        lhead.addStretch(1)
+        lhead.addWidget(lsub)
+        ll.addLayout(lhead)
+        self.toplist = TopList()
+        ll.addWidget(self.toplist, 1)
+        body.addWidget(left, 3)
+
+        right = QVBoxLayout()
+        right.setSpacing(12)
+
+        alerts = QFrame()
+        alerts.setObjectName("card")
+        al = QVBoxLayout(alerts)
+        al.setContentsMargins(16, 14, 16, 12)
+        al.setSpacing(6)
+        ahead = QHBoxLayout()
+        at = QLabel("最近告警")
+        at.setObjectName("cardTitle")
+        self.alert_count = QLabel("")
+        self.alert_count.setObjectName("hint")
+        ahead.addWidget(at)
+        ahead.addStretch(1)
+        ahead.addWidget(self.alert_count)
+        al.addLayout(ahead)
+        self.alert_box = QVBoxLayout()
+        self.alert_box.setSpacing(8)
+        al.addLayout(self.alert_box)
+        al.addStretch(1)
+        right.addWidget(alerts, 1)
+
+        trend = QFrame()
+        trend.setObjectName("card")
+        tl = QVBoxLayout(trend)
+        tl.setContentsMargins(16, 14, 16, 12)
+        tl.setSpacing(6)
+        thead = QHBoxLayout()
+        tt = QLabel("近 7 天净增")
+        tt.setObjectName("cardTitle")
+        thint = QLabel("涨红 跌绿")
+        thint.setObjectName("hint")
+        thead.addWidget(tt)
+        thead.addStretch(1)
+        thead.addWidget(thint)
+        tl.addLayout(thead)
+        self.spark = Sparkline()
+        tl.addWidget(self.spark, 1)
+        right.addWidget(trend, 1)
+
+        body.addLayout(right, 2)
+        root.addLayout(body, 1)
+
+        # footer
+        foot = QHBoxLayout()
+        foot.setSpacing(10)
+        self.db_label = ElidedLabel("")
+        self.db_label.setStyleSheet("color:%s; font-size:11px;" % MUT)
+        foot.addWidget(self.db_label, 1)
+
+        self.note = QLabel(NOTE_DEFAULT)
+        self.note.setStyleSheet("color:%s; font-size:11px;" % MUT)
+        foot.addWidget(self.note, 0)
+
+        self.btn_refresh = QPushButton("刷新")
+        self.btn_refresh.setObjectName("ghost")
+        self.btn_refresh.clicked.connect(self.refresh)
+        foot.addWidget(self.btn_refresh)
+
+        self.btn_report = QPushButton("打开日报")
+        self.btn_report.setObjectName("ghost")
+        self.btn_report.clicked.connect(open_latest_report)
+        foot.addWidget(self.btn_report)
+
+        self.btn_pause = QPushButton("暂停")
+        self.btn_pause.setObjectName("ghost")
+        self.btn_pause.clicked.connect(self._toggle_pause)
+        foot.addWidget(self.btn_pause)
+
+        self.btn_scan = QPushButton("立即扫描")
+        self.btn_scan.setObjectName("primary")
+        self.btn_scan.clicked.connect(self._ask_scan)
+        foot.addWidget(self.btn_scan)
+
+        root.addLayout(foot)
+
+    # ---------------- data
+    def refresh(self) -> None:
+        if self._loading:
+            return
+        self._loading = True
+        self.btn_refresh.setEnabled(False)
+        self._pool.start(LoadJob(datafeed.find_db(), self._bridge))
+
+    def _on_failed(self, message: str) -> None:
+        self._loading = False
+        self.btn_refresh.setEnabled(True)
+        self.subtitle.setText("读取失败：%s" % message)
+        self.pill.set_state("error")
+
+    def _on_loaded(self, dash: datafeed.Dashboard) -> None:
+        self._loading = False
+        self.btn_refresh.setEnabled(True)
+        self.dash = dash
+        self._render(dash)
+
+    def _render(self, d: datafeed.Dashboard) -> None:
+        state = d.state
+        self.pill.set_state(state)
+        icon_state = "error" if state == "error" else state
+        self.setWindowIcon(make_icon(icon_state, d.capacity.used_ratio))
+
+        last = datafeed.ago(d.capacity.ts or d.snapshot.ts, d.refreshed)
+        if d.paused:
+            self.subtitle.setText("C: 只读监控 · 已暂停 · 采集进程跳过调度")
+        elif d.snapshot.scanning:
+            self.subtitle.setText("C: 只读监控 · 正在扫描（%s 开始）· 每 %d 分钟一次"
+                                  % (d.snapshot.scan_started[11:16], d.interval_min))
+        else:
+            self.subtitle.setText("C: 只读监控 · 心跳 %s · 每 %d 分钟一次"
+                                  % (last, d.interval_min))
+
+        self.btn_pause.setText("恢复" if d.paused else "暂停")
+        self.btn_scan.setEnabled(not d.paused)
+        if self.tray is not None:
+            self.tray.sync_pause(d.paused)
+
+        used_pct = int(round(d.capacity.used / d.capacity.total * 100)) if d.capacity.total else 0
+        low = d.capacity.free < d.free_alert_gb * (1024 ** 3)
+        self.logo.setPixmap(make_pixmap(icon_state, 40, d.capacity.used_ratio))
+        self.card_free.set(
+            datafeed.size(d.capacity.free),
+            "共 %s · 已用 %d%%" % (datafeed.size(d.capacity.total), used_pct),
+            color=RED if low else TEXT,
+            badge="低于告警线" if low else "")
+
+        net_color = RED if d.today.net > 0 else (GREEN if d.today.net < 0 else TEXT)
+        self.card_today.set(
+            datafeed.size(d.today.net, True),
+            "新增 %s · 移出 %s"
+            % (datafeed.size(d.today.added), datafeed.size(abs(d.today.removed))),
+            color=net_color)
+        self.top_hint.setText("%s 条事件 · 按一级目录聚合"
+                              % format(d.today.events, ","))
+
+        if d.snapshot.scanning:
+            self.card_snap.set(
+                "扫描中",
+                "本次 %s 开始 · 上次完成 %s"
+                % (d.snapshot.scan_started[11:16],
+                   d.snapshot.ts[11:16] if d.snapshot.ts else "--"),
+                color=ACCENT)
+        else:
+            # "完整/部分" moved to the badge: as text it pushed the subtitle
+            # past the card width once the file count reached seven digits.
+            self.card_snap.set(
+                d.snapshot.ts[11:16] if d.snapshot.ts else "--",
+                "%s · %s 个文件"
+                % (datafeed.duration(d.snapshot.elapsed),
+                   datafeed.count(d.snapshot.files)),
+                color=AMBER if d.snapshot.partial else TEXT,
+                badge="部分完成" if d.snapshot.partial else "")
+
+        usn_ok = (d.usn.status or "").lower() == "active"
+        self.card_usn.set(
+            "活跃" if usn_ok else (d.usn.status or "--"),
+            "上次轮询 %s · %s 条"
+            % (datafeed.ago(d.usn.last_poll, d.refreshed), format(d.usn.records, ",")),
+            color=TEXT if usn_ok else AMBER)
+
+        self.toplist.set_items(d.top)
+
+        while self.alert_box.count():
+            item = self.alert_box.takeAt(0)
+            widget = item.widget()
+            if widget:
+                widget.deleteLater()
+        if not d.alerts:
+            empty = QLabel("暂无告警")
+            empty.setStyleSheet("color:%s; font-size:12px;" % MUT)
+            self.alert_box.addWidget(empty)
+            self.alert_count.setText("")
+        else:
+            self.alert_count.setText(
+                "今日 %d 条" % d.alert_total if d.alert_total else "%d 条" % len(d.alerts))
+            for alert in d.alerts:
+                self.alert_box.addWidget(self._alert_row(alert))
+
+        self.spark.set_data(d.trend)
+        self.db_label.setText("数据：%s · 更新于 %s" % (d.db_path, d.refreshed.strftime("%H:%M:%S")))
+        if d.error:
+            self.subtitle.setText(d.error)
+
+        if self.tray:
+            self.tray.update_from(d)
+
+    def _alert_row(self, alert: datafeed.Alert) -> QWidget:
+        row = QWidget()
+        lay = QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(8)
+
+        dot = QLabel("●")
+        color = RED if (alert.level or "").lower() in ("error", "crit") else AMBER
+        dot.setStyleSheet("color:%s; font-size:11px;" % color)
+        dot.setFixedWidth(10)
+        lay.addWidget(dot, 0, Qt.AlignTop)
+
+        col = QVBoxLayout()
+        col.setSpacing(1)
+        msg = ElidedLabel(humanize_alert(alert))
+        msg.setStyleSheet("color:%s; font-size:12px;" % TEXT)
+        when = QLabel("%s · %s" % (datafeed.ago(alert.ts, dt.datetime.now()),
+                                   KIND_LABELS.get((alert.kind or "").lower(),
+                                                   alert.kind or "")))
+        when.setStyleSheet("color:%s; font-size:11px;" % MUT)
+        col.addWidget(msg)
+        col.addWidget(when)
+        lay.addLayout(col, 1)
+        return row
+
+    # ---------------- actions (M1-5: write runtime state, never the DB)
+    def _note_flash(self, text: str, ms: int = 6000) -> None:
+        self.note.setText(text)
+        QTimer.singleShot(ms, lambda: self.note.setText(NOTE_DEFAULT))
+
+    def _ask_scan(self) -> None:
+        """Ask the daemon for one snapshot. The UI stays unelevated.
+
+        Nothing is scanned from here: we drop a request and poke an event, the
+        elevated daemon does the reading. Worst case it notices within 5 s.
+        """
+        if self.dash is not None and self.dash.paused:
+            self._note_flash("监控已暂停，先恢复再扫描")
+            return
+        control_client.request_scan(datafeed.find_db())
+        self._note_flash("已请求扫描 · 采集进程数秒内开始")
+        QTimer.singleShot(4000, self.refresh)
+        QTimer.singleShot(15000, self.refresh)
+
+    def _toggle_pause(self) -> None:
+        now_paused = not bool(self.dash is not None and self.dash.paused)
+        control_client.set_paused(datafeed.find_db(), now_paused)
+        self._note_flash("已暂停监控 · 采集进程跳过调度（正在跑的扫描会中止）"
+                         if now_paused else "已恢复监控")
+        QTimer.singleShot(600, self.refresh)
+
+    def closeEvent(self, event):  # noqa: N802
+        if self.tray and self.tray.available:
+            event.ignore()
+            self.hide()
+            self.tray.notify_once(
+                "C 盘哨兵仍在后台运行",
+                "双击托盘图标可再次打开面板，右键可退出。")
+        else:
+            event.accept()
+
+
+KIND_LABELS = {
+    "self_growth": "自身数据增长",
+    "low_free_space": "空间告警",
+    "growth_spike": "增长异常",
+    "usn_gap": "事件流中断",
+}
+
+
+def humanize_alert(alert: datafeed.Alert) -> str:
+    """The daemon writes English log lines; show a compact Chinese summary.
+
+    Kept deliberately short: the row is one line, and a half-elided sentence
+    looks worse than a terse one. Full detail stays in the daily report.
+    """
+    import re
+
+    kind = (alert.kind or "").lower()
+    msg = alert.message or ""
+    if kind == "self_growth":
+        mib = re.search(r"reached ([\d.]+) MiB", msg)
+        limit = re.search(r"limit ([\d.]+) MiB", msg)
+        if mib and limit:
+            return "自身数据 %s，超过上限 %s" % (
+                datafeed.size(float(mib.group(1)) * 1024 ** 2),
+                datafeed.size(float(limit.group(1)) * 1024 ** 2))
+        return "监控数据目录偏大，建议收紧保留策略"
+    if kind == "low_free_space":
+        gib = re.search(r"free space ([\d.]+) GiB", msg)
+        thr = re.search(r"([\d.]+) GiB threshold", msg)
+        if gib:
+            return "C: 可用 %s GB，低于告警线 %s GB" % (
+                gib.group(1), thr.group(1) if thr else "--")
+        return "C: 可用空间低于告警线"
+    return msg or kind
+
+
+def latest_report() -> Path | None:
+    root = datafeed.app_root()
+    for base in (root / "reports" / "daily",):
+        if not base.is_dir():
+            continue
+        files = sorted(base.glob("*.html"))
+        if files:
+            return files[-1]
+    return None
+
+
+def open_latest_report() -> None:
+    path = latest_report()
+    if not path:
+        QMessageBox.information(None, "暂无日报", "报告目录里还没有 HTML 日报。\n"
+                                "守护进程每天 %s 点生成，也可以先跑一次 report。" % 8)
+        return
+    QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+
+
+# ------------------------------------------------------------------ tray
+
+class TrayController(QObject):
+    def __init__(self, app: QApplication):
+        super().__init__(app)
+        self.app = app
+        self.available = QSystemTrayIcon.isSystemTrayAvailable()
+        self.window = Dashboard(self)
+        self._notified = False
+
+        self.menu = QMenu()
+        self.act_open = self.menu.addAction("打开面板")
+        self.act_open.triggered.connect(self.show_window)
+        self.act_report = self.menu.addAction("打开日报")
+        self.act_report.triggered.connect(open_latest_report)
+        self.menu.addSeparator()
+        self.act_scan = self.menu.addAction("立即扫描")
+        self.act_scan.triggered.connect(self.window._ask_scan)
+        self.act_pause = self.menu.addAction("暂停监控")
+        self.act_pause.setCheckable(True)
+        self.act_pause.triggered.connect(self._toggle_pause)
+        self.menu.addSeparator()
+        self.act_quit = self.menu.addAction("退出")
+        self.act_quit.triggered.connect(self.quit)
+
+        if self.available:
+            self.icon = QSystemTrayIcon(make_icon("unknown"), self)
+            self.icon.setContextMenu(self.menu)
+            self.icon.setToolTip("C 盘哨兵 · 正在读取…")
+            self.icon.activated.connect(self._on_activated)
+            self.icon.show()
+
+    def _on_activated(self, reason) -> None:
+        if reason in (QSystemTrayIcon.DoubleClick, QSystemTrayIcon.Trigger):
+            self.show_window()
+
+    def show_window(self) -> None:
+        self.window.show()
+        self.window.raise_()
+        self.window.activateWindow()
+
+    def update_from(self, dash: datafeed.Dashboard) -> None:
+        state = dash.state
+        if self.available:
+            self.icon.setIcon(make_icon(state, dash.capacity.used_ratio))
+            text, _, _, _ = STATE_STYLE.get(state, STATE_STYLE["unknown"])
+            self.icon.setToolTip(
+                "C 盘哨兵 · %s\n可用 %s / %s\n今日 %s（%s 条事件）"
+                % (text, datafeed.size(dash.capacity.free),
+                   datafeed.size(dash.capacity.total),
+                   datafeed.size(dash.today.net, True),
+                   format(dash.today.events, ",")))
+
+    def notify_once(self, title: str, body: str) -> None:
+        if not self.available or self._notified:
+            return
+        self._notified = True
+        self.icon.showMessage(title, body, QSystemTrayIcon.Information, 4000)
+
+    def _toggle_pause(self, checked: bool) -> None:
+        # Route through the window so the footer button, the menu label and the
+        # status pill all agree; refresh() restores the authoritative state.
+        self.window._toggle_pause()
+
+    def sync_pause(self, paused: bool) -> None:
+        """Called from Dashboard._render -- keeps the menu in step with the file."""
+        self.act_pause.setChecked(paused)
+        self.act_pause.setText("恢复监控" if paused else "暂停监控")
+
+    def quit(self) -> None:
+        self.window.tray = None
+        self.app.quit()
+
+
+# ------------------------------------------------------------------ main
+
+def main(argv: list[str]) -> int:
+    shot = None
+    show_window = "--window" in argv
+    if "--shot" in argv:
+        idx = argv.index("--shot")
+        if idx + 1 < len(argv):
+            shot = argv[idx + 1]
+
+    app = QApplication(argv)
+    app.setApplicationName("CDriveSentinel Tray")
+    app.setQuitOnLastWindowClosed(False)
+    app.setStyleSheet(QSS)
+
+    base = QFont("Microsoft YaHei UI", 9)
+    app.setFont(base)
+
+    if not shot and "--smoke" not in argv:
+        # One tray per desktop. A second launch just tells the user where to look.
+        guard = QSharedMemory("CDriveSentinel.Tray.Prototype.v1")
+        if guard.attach() or not guard.create(1):
+            QMessageBox.information(None, "C 盘哨兵",
+                                    "已经有一个实例在运行了，请查看任务栏右下角的托盘图标。")
+            return 0
+        app._guard = guard  # keep the segment alive for the process lifetime
+
+    if shot:
+        win = Dashboard(None)
+        win.resize(1040, 720)
+        win.show()
+        app.processEvents()
+
+        def grab() -> None:
+            path = Path(shot).resolve()
+            win.grab().save(str(path))
+            print("saved:", path)
+            app.quit()
+
+        QTimer.singleShot(1500, grab)
+        app.exec()
+        return 0
+
+    if "--smoke" in argv:
+        tray = TrayController(app)
+
+        def report() -> None:
+            dash = tray.window.dash
+            print("tray_available :", tray.available)
+            print("icon_null      :", tray.icon.icon().isNull() if tray.available else "n/a")
+            print("tooltip        :",
+                  (tray.icon.toolTip().replace("\n", " | ") if tray.available else "n/a"))
+            print("dashboard      :", "loaded" if dash else "not loaded")
+            if dash:
+                print("state          :", dash.state)
+                print("paused         :", dash.paused)
+                print("db             :", dash.db_path)
+                print("top_rows       :", len(dash.top))
+                print("runtime_file   :", control_client.state_path(dash.db_path))
+            tray.quit()
+
+        QTimer.singleShot(int(os.environ.get("SENTINEL_SMOKE_MS", "2500")), report)
+        return app.exec()
+
+    tray = TrayController(app)
+    if tray.available:
+        if show_window:
+            tray.show_window()
+    else:
+        tray.show_window()
+
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
