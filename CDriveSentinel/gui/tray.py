@@ -23,7 +23,10 @@ import os
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+# Source runs need the gui/ folder on sys.path; a frozen build has every module
+# inside _internal/ already, and __file__ there does not point at a real folder.
+if not getattr(sys, "frozen", False):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from PySide6.QtCore import (QObject, QRectF, QRunnable, QSharedMemory, Qt,
                             QThreadPool, QTimer, QUrl, Signal)
@@ -756,7 +759,9 @@ def humanize_alert(alert: datafeed.Alert) -> str:
 
 
 def latest_report() -> Path | None:
-    root = datafeed.app_root()
+    # Reports live under the data folder (ProgramData when installed), next to
+    # the database -- not next to the exe.
+    root = datafeed.home()
     for base in (root / "reports" / "daily",):
         if not base.is_dir():
             continue

@@ -113,7 +113,7 @@ DEFAULT_CONFIG = {
     "snapshot_minutes": 30,
     "window_minutes": 15,
     "top_dir_depth": 3,
-    "max_scan_seconds": 2400,
+    "max_scan_seconds": 3000,
     "vacuum_pages_per_snapshot": 20000,
     "data_budget_mb": 800,
     "keep_snapshot_archives": 1,

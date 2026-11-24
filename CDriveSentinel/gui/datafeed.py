@@ -18,6 +18,7 @@ import datetime as dt
 import json
 import os
 import sqlite3
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -105,33 +106,67 @@ def ago(ts_text, now=None) -> str:
 # ---------------------------------------------------------------- discovery
 
 def app_root() -> Path:
-    """Same idea as p1_config.app_dir(), duplicated to stay decoupled."""
+    """Program folder when frozen, repo root when run from source.
+
+    ``Path(__file__).parent.parent`` happens to be right for a source run, but
+    inside a PyInstaller build ``__file__`` points into ``_internal/`` (or into
+    ``base_library.zip``), which made the old version resolve one directory off.
+    The exe's own folder is the only definition that holds in both cases.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
 
 
+def home() -> Path:
+    """The folder holding ``config/`` and ``data/``.
+
+    This MUST resolve to the same place as ``p1_config.data_dir()``, otherwise
+    the tray shows one database while the daemon writes another -- the failure
+    looks like "the numbers on screen are wrong" and is very hard to diagnose.
+    The rules are duplicated on purpose (this module must not import src/) so
+    keep them in the same order as src/p1_config.py:
+
+      1. SENTINEL_HOME override
+      2. portable.txt beside the exe        -> program folder
+      3. installed build                    -> %PROGRAMDATA%\\CDriveSentinel
+      4. source run                         -> the repo root
+
+    An installed build no longer probes the folder next to the exe: a stray
+    ``data/`` left over from a manual test used to win that lookup and feed the
+    UI a database the daemon had stopped writing to.
+    """
+    env = os.environ.get("SENTINEL_HOME")
+    if env:
+        return Path(os.path.expandvars(env)).expanduser().resolve()
+    root = app_root()
+    if getattr(sys, "frozen", False):
+        if (root / "portable.txt").is_file():
+            return root
+        prog = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
+        return Path(prog) / "CDriveSentinel"
+    return root
+
+
 def find_db() -> Path:
-    """Locate sentinel.db: env override -> dev layout -> installed layout."""
+    """One location, not a search path: whatever the daemon writes."""
     env = os.environ.get("SENTINEL_DB")
     if env:
         return Path(env)
-    dev = app_root() / "data" / "sentinel.db"
-    if dev.is_file():
-        return dev
-    prog = Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData"))
-    return prog / "CDriveSentinel" / "data" / "sentinel.db"
+    return home() / "data" / "sentinel.db"
 
 
 def find_config() -> dict:
-    for p in (app_root() / "config" / "config.json",
-              Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "CDriveSentinel" / "config" / "config.json"):
-        try:
-            if p.is_file():
-                with p.open("r", encoding="utf-8") as fh:
-                    data = json.load(fh)
-                if isinstance(data, dict):
-                    return data
-        except (OSError, ValueError):
-            continue
+    """Read the SAME config.json the daemon reads."""
+    p = home() / "config" / "config.json"
+    try:
+        if p.is_file():
+            with p.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, dict):
+                return data
+    except (OSError, ValueError):
+        pass
     return {}
 
 
