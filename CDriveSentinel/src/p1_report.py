@@ -388,6 +388,19 @@ code{background:#f3f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
 .note{background:#fff8e6;border:1px solid #f2d998;border-radius:8px;padding:10px 14px;
       font-size:13px;color:#7a5b12}
 .bar{background:#eef1f5;border-radius:3px;width:140px;overflow:hidden}
+.tabs{display:grid;grid-template-columns:repeat(3,1fr);border-bottom:2px solid #e3e6eb;margin-top:10px}
+.tab-btn{font-family:inherit;background:#f3f5f9;border:1px solid #e3e6eb;border-bottom:none;
+         padding:9px 12px;cursor:pointer;font-size:13px;font-weight:600;color:#4b5563}
+.tab-btn+.tab-btn{border-left:none}
+.tab-btn:first-child{text-align:center;border-radius:8px 0 0 0}
+.tab-btn:nth-child(2){text-align:center;border-radius:8px 0 0 0}
+.tab-btn:last-child{text-align:center;border-radius:8px 0 0 0}
+.tab-btn:hover:not(:disabled){background:#e8edf7}
+.tab-btn.active{background:#fff;color:#3b6cff;border-bottom:2px solid #3b6cff;margin-bottom:-2px}
+.tab-btn:disabled{opacity:.45;cursor:not-allowed}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+@media print{.tabs{display:none}.tab-panel{display:block!important}}
 </style></head><body><div class='wrap'>""")
     add("<h1>CDriveSentinel P1 · C 盘空间变化日报</h1>")
     add("<div class='meta'>生成 %s ｜ 统计区间 %s ~ %s ｜ 心跳 %s 次</div>" %
@@ -430,9 +443,24 @@ code{background:#f3f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
                      if sc.get("end_delta") is not None else "")
             add("<div class='note'>采样：两次全盘扫描耗时 %.0fs / %.0fs；卷用量在快照开始时刻取样，文件清单在整个扫描区间内采集，二者存在采样错位%s。</div>" %
                 (sc.get("prev_seconds") or 0, sc["curr_seconds"], e(extra)))
+        # Tabbed detail: one row of headings, only one table visible at a time.
+        # Each window gets its own tab group; JS scoped by closest .tabbox.
+        tabs = [("按目录归因", bool(w["dirs"])),
+                ("增长最多的文件", bool(w["winners"])),
+                ("释放最多的文件", bool(w["losers"]))]
+        add("<div class='tabbox'>")
+        add("<div class='tabs' role='tablist'>")
+        for i, (label, available) in enumerate(tabs):
+            cls = "tab-btn active" if i == 0 else "tab-btn"
+            disabled = "" if available else " disabled aria-disabled='true'"
+            add("<button type='button' class='%s' data-i='%d' role='tab'%s>%s</button>" %
+                (cls, i, disabled, e(label)))
+        add("</div>")
+
+        add("<div class='tab-panel active' data-i='0' role='tabpanel'>")
         if w["dirs"]:
             mx = max(abs(d["net"]) for d in w["dirs"]) or 1
-            add("<h2>按目录归因</h2><table><tr><th>目录</th><th>净变化</th><th>增长</th><th>释放</th><th>文件数</th><th></th></tr>")
+            add("<table><tr><th>目录</th><th>净变化</th><th>增长</th><th>释放</th><th>文件数</th><th></th></tr>")
             for d in w["dirs"]:
                 add("<tr><td><code>%s</code></td><td class='num %s'>%s</td>"
                     "<td class='num'>+%s</td><td class='num'>-%s</td><td class='num'>%s</td>"
@@ -441,18 +469,32 @@ code{background:#f3f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
                      signed(d["net"]), human(d["grew"]), human(d["freed"]),
                      d["n"], _bar(d["net"], mx)))
             add("</table>")
+        else:
+            add("<div class='meta'>本时段无目录变化数据。</div>")
+        add("</div>")
+
+        add("<div class='tab-panel' data-i='1' role='tabpanel'>")
         if w["winners"]:
-            add("<h2>增长最多的文件</h2><table><tr><th>变化</th><th>操作</th><th>路径</th></tr>")
+            add("<table><tr><th>变化</th><th>操作</th><th>路径</th></tr>")
             for f in w["winners"]:
                 add("<tr><td class='num pos'>%s</td><td>%s</td><td><code>%s</code></td></tr>" %
                     (signed(f["delta_bytes"]), e(f["op"]), e(f["path"])))
             add("</table>")
+        else:
+            add("<div class='meta'>本时段无增长文件。</div>")
+        add("</div>")
+
+        add("<div class='tab-panel' data-i='2' role='tabpanel'>")
         if w["losers"]:
-            add("<h2>释放最多的文件</h2><table><tr><th>变化</th><th>操作</th><th>路径</th></tr>")
+            add("<table><tr><th>变化</th><th>操作</th><th>路径</th></tr>")
             for f in w["losers"]:
                 add("<tr><td class='num neg'>%s</td><td>%s</td><td><code>%s</code></td></tr>" %
                     (signed(f["delta_bytes"]), e(f["op"]), e(f["path"])))
             add("</table>")
+        else:
+            add("<div class='meta'>本时段无释放文件。</div>")
+        add("</div>")
+        add("</div>")
         add("<div class='note'>未归因 = 卷已用变化 − 已归因文件增量。来源：卷影副本/还原点（删除大文件后空间可能未立即释放）、权限跳过的目录、簇对齐 slack、MFT 元数据，以及扫描期间发生但未被两张快照同时捕捉的变化。不把它硬摊到某个文件夹上。</div>")
 
     inprog = data.get("in_progress_snapshot")
@@ -512,6 +554,20 @@ code{background:#f3f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
 
     add("<h2>口径与约束</h2><div class='note'>分配大小（簇对齐；压缩/稀疏用 GetCompressedFileSizeW）、硬链接按 NTFS 文件 ID 只计一次并归属到枚举时首个路径（故 WinSxS / System32 的目录级数值可能与 WizTree 或 P0 报告略有差异，卷总量与差分增量不受影响）、快照按 FRN 对齐（重命名记 RENAME 且 delta=0）。<br>本系统只读：不创建、修改、删除被监控卷上的任何文件；所有数据写入独立的数据目录（默认位于项目文件夹，可配置）。<br>P1 快照事件默认 evidence=snapshot / confidence=medium；P2 用 USN 按 FRN 关联后升级为 usn+snapshot / high，并补齐 reason_mask 与精确 UTC 时间；两次快照之间的瞬态事件单独列出，不写入空间账本。</div>")
     add("<div class='meta'>CDriveSentinel P1 · 报告数据：data/sentinel.db · 逐事件日志：data/logs/YYYY-MM-DD.jsonl</div>")
+    add("""<script>
+document.addEventListener('click', function(ev) {
+  var btn = ev.target.closest ? ev.target.closest('.tab-btn') : null;
+  if (!btn || btn.disabled) return;
+  var box = btn.closest('.tabbox');
+  if (!box) return;
+  var idx = btn.getAttribute('data-i');
+  var tabs = box.querySelectorAll('.tab-btn');
+  for (var i = 0; i < tabs.length; i++) tabs[i].classList.toggle('active', tabs[i] === btn);
+  var panels = box.querySelectorAll('.tab-panel');
+  for (var j = 0; j < panels.length; j++)
+    panels[j].classList.toggle('active', panels[j].getAttribute('data-i') === idx);
+});
+</script>""")
     add("</div></body></html>")
     return "\n".join(parts) + "\n"
 

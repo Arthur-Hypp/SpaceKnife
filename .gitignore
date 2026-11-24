@@ -240,6 +240,7 @@ CDriveSentinel/reports/
 
 # Dev logs & backups (machine-specific, large)
 Log/
+CDriveSentinel_backup_*/
 
 # WorkBuddy project metadata
 .workbuddy/

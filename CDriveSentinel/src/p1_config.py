@@ -67,6 +67,7 @@ DEFAULT_CONFIG = {
     "daily_report_enabled": True,
     "daily_report_hour": 8,
     "daily_report_top": 20,
+    "daily_popup_enabled": True,
     "wiztree": {
         "exe": "tools/WizTree64.exe",
         "note": "P1 diffs by NTFS file ID; WizTree CSV has no FRN column, so P1 uses the built-in scanner. WizTree is used by P0 and planned for P2."

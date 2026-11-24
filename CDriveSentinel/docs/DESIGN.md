@@ -704,8 +704,9 @@ Sysmon 窄规则/ETW 抓取、告警联动、PySide6 桌面面板、历史趋势
 - [x] P0 基线采集脚本（只读，一键导出到 D 盘）— 2026-11-16 已实现：`src/p0_baseline.py` + `src/p0_scan.py` + `run_p0.ps1`
 - [x] P1 快照差分守护进程 + SQLite + 日报 CLI — 2026-11-16 已实现，见第 9 章 P1 节
 - [x] P2 USN 事件流、FRN 关联、游标与 gap 重同步 — 2026-11-16 已实现，见第 9 章 P2 节；读取记录需管理员，本会话已验证权限边界与降级路径
+- [x] P3 登录自启弹前一天日报（独立普通权限计划任务 `CDriveSentinel-OpenReport`，浏览器打开 HTML，每天一次）— 2026-11-24 实现，方案见 `docs/P3_DAILY_POPUP_PLAN.md`；待用户实测登录触发
 - [ ] P3 进程归因（Sysmon / ETW）、桌面通知、可选 PySide6 面板
-- [x] 验收自动化（沙箱 CREATE/EXTEND/DELETE/RENAME/硬链接 + USN V2/V3/V4 解析 + 游标状态机 + 证据升级 + 留存/代次/追平）— `src/main.py selftest` **32/32 通过**（P2.3 后）
+- [x] 验收自动化（沙箱 CREATE/EXTEND/DELETE/RENAME/硬链接 + USN V2/V3/V4 解析 + 游标状态机 + 证据升级 + 留存/代次/追平 + 弹窗日期/去重纯逻辑）— `src/main.py selftest` **37/37 通过**（P3 后）
 - [ ] 验收用例 1/2 的真实 1 GiB 文件实测（当前为 MiB 级沙箱等价验证）
 - [x] 以管理员终端实测 `usn-poll` 真实事件流 — 2026-11-16 17:02 完成，verify 7/7 PASS
 - [x] P2.3 留存与索引代次（F14–F20）— 代码与自检完成；管理员侧 A8–A12 见 `Log\P2_3_管理员复测清单.md`

@@ -411,6 +411,95 @@ def cmd_report(cfg, paths, args):
     return 0
 
 
+def popup_target_day(now=None):
+    """Return (today_str, yesterday_str) in local time. Pure and testable.
+
+    The daily report is always for YESTERDAY so a whole day of data is present;
+    keeping this as a pure function makes month/year boundaries testable.
+    """
+    now = now or datetime.datetime.now()
+    today = now.date()
+    return (today.strftime("%Y-%m-%d"),
+            (today - datetime.timedelta(days=1)).strftime("%Y-%m-%d"))
+
+
+def popup_is_due(marked_day, today_str):
+    """True when no successful popup has been recorded for today."""
+    return (marked_day or "") != today_str
+
+
+def cmd_open_report(cfg, paths, args):
+    """Login-time one-shot: open YESTERDAY's HTML report in the default browser.
+
+    This is deliberately a separate CLI command (and a separate scheduled
+    task) from the resident daemon: the daemon runs elevated, and launching a
+    browser from an elevated process makes Chrome/Edge refuse to start.
+
+    Failure-safe: the "already popped today" marker is written ONLY after the
+    browser launch succeeds, so a failed attempt is retried at next logon.
+    """
+    if not bool(cfg.get("daily_popup_enabled", True)):
+        log("open-report: disabled by config (daily_popup_enabled=false)")
+        return 0
+    if not paths["db"].is_file():
+        log("open-report: database not found: %s" % paths["db"])
+        return 2
+    today_str, yesterday = popup_target_day()
+    conn = db.connect(paths["db"])
+    try:
+        db.init_schema(conn)
+        marked = db.get_state(conn, "report.popup_day") or ""
+        if not popup_is_due(marked, today_str):
+            log("open-report: already popped today (%s), skip" % today_str)
+            return 0
+
+        html = paths["reports"] / ("%s.html" % yesterday)
+        if html.is_file():
+            log("open-report: reuse existing report %s" % html.name)
+        else:
+            # Early logon (before the daemon's daily_report_hour) can happen
+            # before yesterday's report exists. Generate it on demand here;
+            # yesterday is already closed, so its data is final.
+            log("open-report: %s missing, generating on demand ..." % html.name)
+            out = report.write_report(
+                conn, cfg, paths, yesterday, None, None,
+                int(cfg.get("daily_report_top", 20)), make_html=True)
+            html = out["html_path"]
+            if not html or not html.is_file():
+                raise RuntimeError("report generation produced no HTML file")
+            try:
+                portal, _ = report.write_portal(conn, cfg, paths)
+                log("open-report: portal refreshed: %s" % portal)
+            except Exception as exc:
+                log("open-report: portal refresh failed (non-fatal): %s: %s" %
+                    (type(exc).__name__, exc))
+            log("open-report: generated %s" % html)
+
+        if args.dry_run:
+            log("open-report: dry-run, would open %s "
+                "(browser not launched, marker not written)" % html)
+            return 0
+
+        # os.startfile goes through the shell file association, so the report
+        # opens in the user's default browser at normal (non-elevated) level.
+        try:
+            os.startfile(str(html))
+        except Exception as exc:
+            log("open-report: FAILED to launch browser for %s: %s: %s "
+                "(marker not written)" % (html, type(exc).__name__, exc))
+            return 3
+        db.set_state(conn, "report.popup_day", today_str)
+        conn.commit()
+        log("open-report: opened %s in default browser; marked report.popup_day=%s" %
+            (html, today_str))
+        return 0
+    except Exception as exc:
+        log("open-report: FAILED: %s: %s" % (type(exc).__name__, exc))
+        return 4
+    finally:
+        conn.close()
+
+
 def cmd_status(cfg, paths, args):
     if not paths["db"].is_file():
         log("database not found: %s" % paths["db"])
@@ -1109,6 +1198,25 @@ def cmd_selftest(cfg, paths, args):
           needs_catch_up(5 * mib) is True and needs_catch_up(1 * mib) is False
           and needs_catch_up(0) is False,
           "5 MiB -> True, 1 MiB -> False")
+
+    # ---- P3: login popup -- date target + once-per-day dedup (pure logic) ----
+    t, y = popup_target_day(datetime.datetime(2026, 11, 24, 9, 0))
+    check("P3 popup: normal day targets yesterday",
+          t == "2026-11-24" and y == "2026-11-23", "%s / %s" % (t, y))
+    t, y = popup_target_day(datetime.datetime(2026, 3, 1, 9, 0))
+    check("P3 popup: month boundary 03-01 -> 02-28",
+          t == "2026-03-01" and y == "2026-02-28", "%s / %s" % (t, y))
+    t, y = popup_target_day(datetime.datetime(2024, 3, 1, 9, 0))
+    check("P3 popup: leap year 2024-03-01 -> 02-29",
+          y == "2024-02-29", "%s / %s" % (t, y))
+    t, y = popup_target_day(datetime.datetime(2026, 1, 1, 9, 0))
+    check("P3 popup: year boundary 01-01 -> 12-31",
+          y == "2025-12-31", "%s / %s" % (t, y))
+    check("P3 popup: once-per-day dedup state",
+          popup_is_due("", "2026-11-24") is True
+          and popup_is_due("2026-11-23", "2026-11-24") is True
+          and popup_is_due("2026-11-24", "2026-11-24") is False,
+          "empty/other-day due, same-day skip")
     conn.close()
 
     failed = [c for c in checks if not c[1]]
@@ -1126,8 +1234,8 @@ def main(argv=None):
         description="CDriveSentinel P1 - read-only C: drive change attribution")
     parser.add_argument("command", nargs="?", default=None,
                         help="init-db | snapshot | heartbeat | daemon | report | "
-                             "status | selftest | usn-status | usn-poll | usn-index | "
-                             "prune | maintenance")
+                             "open-report | status | selftest | usn-status | "
+                             "usn-poll | usn-index | prune | maintenance")
     parser.add_argument("--mode", default=None, help="alias for command (DESIGN.md style)")
     parser.add_argument("--config", default=None, help="path to config.json")
     parser.add_argument("--volume", default=None, help="override monitored volume")
@@ -1171,6 +1279,7 @@ def main(argv=None):
         "heartbeat": cmd_heartbeat,
         "daemon": cmd_daemon,
         "report": cmd_report,
+        "open-report": cmd_open_report,
         "status": cmd_status,
         "selftest": cmd_selftest,
         "usn-status": cmd_usn_status,
