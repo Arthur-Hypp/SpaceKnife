@@ -17,7 +17,7 @@ C 盘空间变化实时监测与归因工具集。回答一个问题：**C 盘�
 
 ## 特性
 
-- **只读采集**：逐文件扫描 NTFS，按分配大小（`AllocationSize`）计量，压缩/稀疏文件用 `GetCompressedFileSizeW`，硬链接按 NTFS 文件 ID 去重。
+- **只读采集（目录项直读）**：不逐文件 `os.stat`，而是每层目录调一次 `NtQueryDirectoryFile` + `FILE_ID_BOTH_DIR_INFORMATION`，把文件名、64 位 NTFS 文件 ID、属性、大小、mtime 一次取回；按分配大小（`AllocationSize`）计量，压缩/稀疏文件用 `GetCompressedFileSizeW`，硬链接按文件 ID 去重。**全盘（约 117 万行）实测 40.8 s 枚举、61.5 s 含入库**，旧版逐文件 `os.stat` 是 1656 s。非 NTFS / 非 Windows 自动退回 `os.stat` 后端。
 - **快照差分**：FRN 对齐的前后快照流式归并，精确到字节地分类 CREATE / EXTEND / DELETE / RENAME，诚实保留「未归因」残差。
 - **USN 事件流**：直读 USN Journal（V2/V3/V4），秒级时间与操作原因，按 FRN 关联快照事件升级置信度；瞬态事件单列，不注入字节账本。
 - **日报与告警**：每日 txt/HTML 报告、门户页，磁盘余量与增长速度告警。

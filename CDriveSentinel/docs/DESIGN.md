@@ -434,7 +434,8 @@ WizTree64.exe "C:" /export="D:\SpaceKnife-local\CDriveSentinel\data\snapshots\c_
 |---|---|
 | `src\main.py` | 统一 CLI：`init-db / snapshot / heartbeat / daemon / report / status / selftest` |
 | `src\p1_config.py` | 配置加载、**输出盘符硬校验**（数据目录不得落在被监控卷） |
-| `src\p1_snapshot.py` | 逐文件只读枚举：NTFS 文件 ID、分配大小、mtime、重解析点跳过、硬链接去重、超时标记 |
+| `src\p1_snapshot.py` | 逐文件只读枚举：NTFS 文件 ID、分配大小、mtime、重解析点跳过、硬链接去重、超时标记（`dirinfo` / `stat` 两套后端） |
+| `src\p1_fastdir.py` | 目录项直读：`NtQueryDirectoryFile` + `FILE_ID_BOTH_DIR_INFORMATION` 一次取一层目录的全部元数据（名字、FRN、属性、大小、mtime），不需要逐文件 `os.stat` |
 | `src\p1_db.py` | SQLite WAL 建库、心跳/快照/事件/账本/告警表、批量写入、保留清理 |
 | `src\p1_diff.py` | FRN 归并差分、事件分类、JSONL 日志、`diff_run` 残差账本、告警 |
 | `src\p1_report.py` | 日报文本 + HTML、按目录/窗口/单文件聚合、当前占用 Top |
@@ -477,14 +478,42 @@ powershell -ExecutionPolicy Bypass -File .\install_task.ps1   # 注册登录自�
 #### 实现要点
 
 - **归并差分**：`SELECT ... FROM file_state WHERE snapshot_id=? ORDER BY frn` 两个游标流式归并，内存只存当前两行，951k 文件无需全量载入。
-- **FRN 来源**：`os.stat().st_ino`（`DirEntry.stat()` 在 Windows 恒为 0，这是 P0 实测踩过的坑）；取不到时用路径哈希兜底并计数。硬链接按 FRN 去重。
+- **FRN 来源**：目录项直读（`p1_fastdir` → `NtQueryDirectoryFile` + `FILE_ID_BOTH_DIR_INFORMATION`，2026-11-25 起默认后端）或 `os.stat().st_ino` 回退（`DirEntry.stat()` 在 Windows 恒为 0，这是 P0 实测踩过的坑；非 NTFS 卷或非 Windows 上仍走这条路）；取不到时用路径哈希兜底并计数。硬链接按 FRN 去重。
 - **口径**：`allocated_size()` 复用 P0（簇对齐；压缩/稀疏调 `GetCompressedFileSizeW`）；重命名 `delta=0`，只记 `RENAME` 并更新 `frn_path_map`。
 - **残差**：`residual = (used_now - used_prev) - Σdelta`，独立写入 `diff_run` 并在日报单列「未归因」，不摊派到目录。
 - **时间**：UTC 与本地时间由同一个 `datetime` 推导（修正 P0 基线里二者相差数分钟的问题）。
 - **自激防护**：`p1_config.paths()` 拒绝把 `data_root` 放在被监控盘；`_alerts` 在本项目数据目录超过 `data_size_alert_mb`（默认 1024 MiB）时告警；所有产物只在 D 盘。
 - **留存策略**：`file_state` 只保留最近 **2** 个快照（差分所需的最小集合），其余删除并置 `pruned=1`，被裁剪的快照不再作为差分前序；完整逐文件清单按 `archive_mode=daily` **每天只归档一份** gzip CSV（约 22 MiB/份），另保留最近 4 份，超过 `retention_days` 的归档删除。`retention_days` 于 2026-11-16 由 30 降为 **7**（同时作用于 `change_event` / `alert` / `volume_heartbeat` 明细与每日归档）。稳态占用约：`file_state` 455 MiB + 每日归档 22 MiB × 7 天 ≈ 154 MiB，**日增长约 22 MiB**，满足验收用例 6 的「日增长 < 50 MB」；叠加 P2 的 `mft_index` 148 MiB 与 7 天 `usn_event` 314 MiB 后，数据目录稳态约 1.07 GiB（P2.3 的 F20 因此把 `data_size_alert_mb` 提到 1280）。
 - **数据库页回收**：SQLite 删除行后不会自动缩小文件，第三次快照时因此一度涨到 704 MiB。实现 `PRAGMA auto_vacuum=INCREMENTAL`（建库时设置）+ 每次 `prune()` 后 `PRAGMA incremental_vacuum`；已有库用 `python src\main.py maintenance` 一次性转换并 VACUUM（实测 `704.07 MiB → 455.42 MiB`，回收 248.66 MiB）。此后每次快照自动回收空闲页，文件稳定在约 455 MiB。
-- **只读**：全程只调用 `os.scandir / os.stat / GetDiskFreeSpaceExW`，不创建、修改、删除 C 盘任何文件。
+- **只读**：全程只调用 `NtQueryDirectoryFile / CreateFileW(FILE_LIST_DIRECTORY) / os.stat / GetDiskFreeSpaceExW`，不创建、修改、删除 C 盘任何文件。
+
+#### 扫描性能（2026-11-25：全盘 1656 s → 61.5 s）
+
+**旧实现为什么慢**：`_rows_stat` 为了拿到 NTFS 文件 ID，对**每个文件**调一次 `os.stat()`。在 Windows 上这等于 `CreateFileW` + 查 `FileIdInformation` + `CloseHandle`，一条约 1 ms 量级的随机元数据访问；103 万文件就是一千多秒（实测 625–1125 files/s，`elapsed=1656.1 s`）。文件内容一个字节都没读，时间全花在「逐文件打开」上。
+
+**WizTree 为什么快**：它不遍历目录树，而是**顺序读整份 `$MFT`**（1M 文件约 1–2 GB），在内存里解析 1 KB 一条的 FILE 记录。顺序读盘 + 纯内存解析，1–3 分钟很正常；代价是**必须要管理员权限**（直接打开卷），而且只能用于 NTFS。
+
+**现在的做法**（`src\p1_fastdir.py`）：每层目录只开一次句柄（`CreateFileW(FILE_LIST_DIRECTORY | FILE_FLAG_BACKUP_SEMANTICS)`），再用 `NtQueryDirectoryFile(FileInformationClass=37 /*FileIdBothDirectoryInformation*/)` 一次取回整层目录的全部元数据：文件名、64 位 FRN、属性、`EndOfFile`、`AllocationSize`、`LastWriteTime`。每个文件的元数据都是**枚举目录时顺带返回的**，不再有任何逐文件 open，也不需要管理员权限。
+
+实测（同一台机器、非管理员、后台还有一个旧版守护进程在扫，属于有干扰的保守值）：
+
+| 路径 | 耗时 | 说明 |
+|---|---|---|
+| 旧 `stat` 后端，全盘 | **1656.1 s** | 1,034,804 文件 / 200,093 目录 |
+| 新 `dirinfo` 后端，全盘枚举 | **40.8 s** | 1,169,673 行（982,697 文件 + 186,977 目录，硬链接去重 82,992） |
+| 新 `dirinfo` 后端 + SQLite staging | **61.5 s** | 1,169,677 行入库，临时库 96.5 MiB |
+| 微基准 `C:\Windows\WinSxS`（27,921 项） | 0.088 s vs 2.34 s | 目录项直读 vs 逐项 `os.stat`，约 27× |
+
+**等价性**：`tools\verify_backends.py` 对同一棵树跑两套后端逐行比对（FRN、路径、逻辑/分配大小、mtime、属性、is_dir）。`C:\Windows` 全树 167,082 行、`System32` 23,834 行、`drivers` 721 行均为 `only_dirinfo=0 only_stat=0`；唯一差异是两趟之间**正在被写入**的 `winevt\Logs\*.evtx`、`wiatrace.log` 的 size/mtime，属文件真在变化，不是口径差异。因此升级后第一次快照不会把全盘误报成「都变了」。
+
+**两个必须记住的坑**（`p1_fastdir.py` 里都加了注释）：
+
+1. `NtQueryDirectoryFile` 会返回 `.` 和 `..` 两个目录项，`os.scandir` 是滤掉的。递归遍历若信任它们会自己套自己无限递归（路径越走越长、条目重复计数），必须在 `_query` 里丢掉。
+2. 128 KiB 的返回缓冲区**必须每线程一份**（`threading.local()`）：多个线程共用一个缓冲区时，内核正在往里写、另一个线程正在解析，会读出乱码名字和错误属性位。
+
+另外目录项里的 `AllocationSize` 实测恒为 0（哪怕是 339 KB 的文件），所以分配大小仍按簇对齐公式计算，压缩/稀疏文件继续走 `GetCompressedFileSizeW`。
+
+**回退**：非 Windows、非 NTFS、或 `available()` 探测失败时自动退回 `stat` 后端，原因写进 `stats().backend_detail` 并随快照落库，行为与旧版完全一致。
 
 #### 验收结果（2026-11-16）
 
