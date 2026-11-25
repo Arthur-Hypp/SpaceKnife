@@ -71,22 +71,79 @@ def _is_portable() -> bool:
         return False
 
 
+HOME_POINTER = "home.txt"
+
+
+def program_data_root() -> Path:
+    base = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
+    return (Path(base) / APP_NAME).resolve()
+
+
+def read_home_pointer(base=None):
+    """Read the data-folder pointer an installer may have written.
+
+    Returns ``(path, error)``; ``(None, None)`` means "there is no pointer".
+
+    The pointer exists so the program can sit on C: while its data -- a few
+    hundred megabytes of inventory and event history -- lives on another volume.
+    Putting that data on the monitored disk is the one thing this tool should
+    not do: it exists to find out what is eating C:, and it would then be part
+    of the answer.
+
+    A pointer that exists but cannot be used is an error and is reported, never
+    silently skipped -- falling back would put the data somewhere the user did
+    not choose, and the next launch would find an empty database and start over.
+    """
+    folder = Path(base) if base else program_data_root()
+    f = folder / HOME_POINTER
+    try:
+        raw = f.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None, None
+    except OSError as exc:
+        return None, "%s 读不出来：%s" % (f, exc)
+    if not raw:
+        return None, "%s 是空的" % f
+    target = Path(os.path.expandvars(raw)).expanduser()
+    if not target.is_absolute():
+        return None, "%s 必须写绝对路径（现在是 %r）" % (f, raw)
+    if not target.is_dir():
+        return None, "%s 指向的目录不存在：%s" % (f, target)
+    return target.resolve(), None
+
+
+# Set by data_dir() so callers can surface a broken pointer instead of quietly
+# ignoring it. Module-level because data_dir() has no logger by design.
+_LAST_HOME_ERROR = None
+
+
+def home_pointer_error():
+    """Why the last ``data_dir()`` call ignored a pointer, if it did."""
+    return _LAST_HOME_ERROR
+
+
 def data_dir() -> Path:
     """Directory that holds ``config/`` and ``data/``.
 
-    See the module docstring for the resolution order. Source runs and the
-    historical repo layout are unchanged on purpose.
+    Order: SENTINEL_HOME -> installer pointer -> portable.txt -> ProgramData
+    (installed builds) -> the repo root (source runs).
     """
+    global _LAST_HOME_ERROR
     env = os.environ.get("SENTINEL_HOME")
     if env:
+        _LAST_HOME_ERROR = None
         return Path(os.path.expandvars(env)).expanduser().resolve()
 
     if getattr(sys, "frozen", False):
+        target, err = read_home_pointer()
+        _LAST_HOME_ERROR = err
+        if target is not None:
+            return target
         if _is_portable():
             return install_dir()
-        base = os.environ.get("PROGRAMDATA") or r"C:\ProgramData"
-        return (Path(base) / APP_NAME).resolve()
+        return program_data_root()
 
+    _LAST_HOME_ERROR = None
     return install_dir()
 
 
@@ -376,6 +433,9 @@ def paths(cfg: dict) -> dict:
         "auto_relocated_from": auto_relocated,
         "portable": _is_portable(),
         "frozen": frozen,
+        # Non-empty when an install-time pointer file was present but unusable;
+        # the caller should say so out loud instead of pretending all is well.
+        "home_pointer_error": home_pointer_error(),
     }
     # Ready-to-use exclusion list: own data folder (when on the monitored
     # volume) + exclude_paths + legacy skip_paths, already filtered so it can
@@ -516,4 +576,6 @@ def layout_info(cfg: dict | None = None) -> dict:
         "on_monitored_volume": p["same_volume"],
         "auto_relocated": p["auto_relocated_from"],
         "exclude": list(p.get("exclude") or []),
+        "home_pointer": str(program_data_root() / HOME_POINTER),
+        "home_pointer_error": p.get("home_pointer_error") or "",
     }

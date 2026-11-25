@@ -766,3 +766,54 @@ selftest: 79/79
 - 向导只写配置，**不做首次扫描**（只写一条 `request_scan` 请求）。若守护进程没在跑，这次请求会在它下次启动时被消费——`runtime.last_scan_request` 是持久化的。
 - 源码态若 `SENTINEL_HOME` 指向被监控的卷，`data_dir()` 会把它自动重定位到另一块盘（实测会出现在 `C:/CDriveSentinelData`）。这是 M1-1 的既有行为，不是向导引入的，但在"数据放哪"这件事上确实容易让人困惑，值得在 M3 设置页里显式给出实际落点。
 - 已经配好的机器不该被向导打断：`config.json` 里 `setup_complete=true` 即为已配置。本机现有配置被标记为 `setup_profile: "custom"`（手工调过，不属于任何预设），向导不会自动弹出，需要时可用 `--wizard` 手动打开。
+
+### 10.10 M1-7 安装器已交付（2026-11-25）
+
+M1-7 的验收主线是"装完重启即自动采集"。落地时发现一个此前被推迟的决定必须先定：**数据放哪**。工具的存在意义是查清 C: 被什么占掉，若它把自己的 300–600 MB 数据写进 C:，就成了它要解释的那个答案的一部分。所以采用 option B —— 数据目录指针。
+
+#### 数据目录指针（option B）
+
+- 安装器询问"数据保存位置"，默认选第一个非 C: 盘上的 `CDriveSentinelData`（`make_installer.py`/`install.ps1` 与 `.iss` 的 `DefaultDataDir()` 用同一规则）。
+- 选择写入 `%PROGRAMDATA%\CDriveSentinel\home.txt`（一行绝对路径）。采集进程 `p1_config.data_dir()`、托盘 `gui/datafeed.home()` 用同一套规则解析：`SENTINEL_HOME` → **指针** → `portable.txt` → ProgramData → 项目目录。托盘**不 import `src/`**，把指针读取逻辑镜像了一份，注释里写明两侧必须同步。
+- 指针存在但不可用（空 / 相对路径 / 目录不存在）是**错误**，明确报出而不是回落到默认位置——回落会让界面读到一份空库然后重新开始。
+- `CDriveSentinel.exe set-home --to D:\...` / `--clear` 供装机后改盘；只写指针、建目录，**不搬数据**（搬活库是丢数据的经典方式），命令会提示用户自己拷 `data\`/`config\` 再重启任务。
+- 指针指向的目录仍在监控卷上时，照旧整目录排除扫描；`paths` / `layout_info()` 会打印指针路径与错误。
+
+#### 两个计划任务（按验收标准补齐）
+
+F23 与 M1-7 验收都写"注册两个计划任务"，此前只做了采集任务，本轮补齐第二个：
+
+| 任务 | 安装脚本 | 权限 | 触发 | 作用 |
+|---|---|---|---|---|
+| `CDriveSentinel` | `install_task.ps1 -Start` | Highest | AtLogOn | 提权采集 + USN 深读，装完立即启动首扫 |
+| `CDriveSentinel-OpenReport` | `install_popup_task.ps1` | 普通（不 Highest） | AtLogOn +15s | 每天在用户会话弹昨天日报（提权进程开浏览器会被 Chrome/Edge 拒绝） |
+
+- 两条路径（脚本安装器 `install.ps1`、Inno `CDriveSentinel.iss`）都注册这两个任务、都在卸载时清理这两个任务（`UninstallRun` 用两个 `RunOnceId`：`RemoveCollectorTask` / `RemovePopupTask`）——避免"卸载后残留一个每天弹窗的孤儿任务"。
+- `install.ps1` 的 `Stop-Running` 同时停两个任务；`build.py` 现在把两个任务安装脚本都打进 dist。
+- 顺带修掉 `.iss` 里 `install_task.ps1` 被列两次（一次来自 dist、一次来自源码树）的重复 Source 行——编译出的 Setup.exe 只应依赖 dist 产物。
+
+#### 权限、自启与卸载
+
+- `data\runtime`、`data\logs` 给 `BUILTIN\Users` 修改权限（`install.ps1` 用 SID `*S-1-5-32-545` 避免本地化名问题；`.iss` 用 `[Dirs] Permissions: users-modify`）——托盘不提权也能写"立即扫描/暂停"便条，否则按钮静默失效。
+- 托盘自启走 HKLM `Run`（per-machine，每个账号一个图标；托盘自身有单实例互斥）。
+- 卸载默认**保留**历史数据，删除数据需 `-PurgeData` 或安装器里确认；升级/重跑安装保留现有 `sentinel.db` 与其配置。
+
+#### 实测
+
+```
+selftest（源码态）           84/84   （新增 6 项 M1-7 指针用例：无指针/有效/相对拒绝/不存在/空/报错）
+PowerShell 三脚本语法解析     3/3 OK
+python build.py              100 MiB，两个 exe + 两个任务脚本 + install.ps1 + setup.cmd 齐全
+打包 exe paths                frozen / ProgramData / home_pointer 行正确；排除清单含 programdata 子树
+打包 exe selftest            83/84  （唯一失败项见下方边界，6 项 M1-7 用例全过）
+README.md / 使用说明.txt     已同步一键安装、两个任务、set-home 入口
+```
+
+#### 边界
+
+- **安装包已在本机编译成功（2026-11-25）**：`winget install --id JRSoftware.InnoSetup -e --silent` 装了 Inno Setup 6.7.3（用户目录 `%LOCALAPPDATA%\Programs\Inno Setup 6\`，未动系统 PATH/服务）；`make_installer.py` 经注册表找到 ISCC，`CDriveSentinel.iss` 零错误编译通过。产物 `dist\CDriveSentinel-0.2.0-Setup.exe`，**27.5 MiB**，SHA-256 `9e1f7fdc57e32f03e4333fe7b568d37b9b1cc87463227c6c980e17c91a7a0287`。注意：这仍是**非商业用途**编译（ISCC 输出 "Non-commercial use only"），商用发布需购买 Inno Setup 许可证。
+- **干净虚拟机端到端未实测**：本机只编译了安装包，没有真的运行 `Setup.exe` 安装（那会注册计划任务、写 ProgramData、改 HKLM Run——属于本机系统变更，未擅自做）。"装完重启即自动采集"这条验收仍需在一台干净 Win10/11 上跑一遍安装包确认。
+- **打包态 selftest 83/84**：唯一失败项是既有的环境假设——沙箱取自 `paths["root"]/data/selftest`，打包态 root 即 `%PROGRAMDATA%`（在监控盘 C: 上），触发"沙箱须在监控盘外"的断言。这是 selftest 自身的路径约定问题，与 M1-7 改动无关；源码态（root 在 D:）84/84 全绿。修法应让 selftest 在打包态用可重定向的临时根目录，留待后续。
+- **两个任务的 principal 归属**：`install_popup_task.ps1` 按"安装时的当前用户"注册（`USERDOMAIN\USERNAME`）。per-machine 安装若由管理员账号执行、日常登录是另一账号，日报弹窗任务会挂在管理员账号下而不在日常会话触发。多账号机器需在目标账号下重跑该脚本，或改为 per-user 触发——留给 M3 设置页处理。
+- 脚本安装器 `install.ps1` 与 Inno `.iss` 是两套并行实现，行为对齐但需各自维护；长期应统一到一套生成的安装定义。
+- M1-8（CI 产出安装包 + SHA-256）尚未开始，依赖 ISCC 先在 CI 环境可用。

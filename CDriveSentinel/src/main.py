@@ -1670,6 +1670,43 @@ def cmd_selftest(cfg, paths, args):
         bad_profile_rejected = True
     check("M1-6 an unknown profile is rejected", bad_profile_rejected)
 
+    # ---- M1-7 option B: data folder pointer ------------------------------
+    # The program may sit on C: while its data lives on another volume. The
+    # pointer is the only thing that makes both the collector and the tray
+    # resolve the same folder, so every way it can be wrong has to be loud.
+    pdata = sandbox / "programdata"
+    (pdata / config.APP_NAME).mkdir(parents=True, exist_ok=True)
+    saved_pd = os.environ.get("PROGRAMDATA")
+    os.environ["PROGRAMDATA"] = str(pdata)
+    try:
+        pointer = pdata / config.APP_NAME / config.HOME_POINTER
+        target, err = config.read_home_pointer()
+        check("M1-7 no pointer is not an error", target is None and err is None,
+              str(err))
+        alt = sandbox / "alt_home"
+        alt.mkdir(exist_ok=True)
+        pointer.write_text(str(alt) + "\n", encoding="utf-8")
+        target, err = config.read_home_pointer()
+        check("M1-7 a valid pointer is honoured",
+              target == alt.resolve() and err is None, "%s | %s" % (target, err))
+        pointer.write_text("relative\\folder\n", encoding="utf-8")
+        target, err = config.read_home_pointer()
+        check("M1-7 a relative pointer is refused, never guessed",
+              target is None and err and "绝对路径" in err, str(err)[:70])
+        pointer.write_text(str(sandbox / "missing_dir") + "\n", encoding="utf-8")
+        target, err = config.read_home_pointer()
+        check("M1-7 a pointer to a missing folder is reported",
+              target is None and err and "不存在" in err, str(err)[:70])
+        pointer.write_text("\n", encoding="utf-8")
+        target, err = config.read_home_pointer()
+        check("M1-7 an empty pointer is reported",
+              target is None and err and "空" in err, str(err)[:70])
+    finally:
+        if saved_pd is None:
+            os.environ.pop("PROGRAMDATA", None)
+        else:
+            os.environ["PROGRAMDATA"] = saved_pd
+
     save_cfg = dict(user_cfg)
     save_cfg["_config_path"] = "runtime-only"
     save_cfg["setup_complete"] = True
@@ -2210,8 +2247,12 @@ def cmd_paths(cfg, paths, args):
     log("CDriveSentinel layout")
     for key in ("frozen", "portable", "install", "data_root", "config",
                 "config_file", "db", "reports", "on_monitored_volume",
-                "auto_relocated"):
+                "auto_relocated", "home_pointer"):
         log("  %-18s: %s" % (key, info[key]))
+    # A pointer that exists but cannot be used changes where the data lives;
+    # say it out loud rather than letting the paths above look intentional.
+    if info.get("home_pointer_error"):
+        log("  %-18s: %s" % ("pointer ERROR", info["home_pointer_error"]))
     excluded = info["exclude"]
     if excluded:
         log("  %-18s: %s" % ("exclude[0]", excluded[0]))
@@ -2222,6 +2263,74 @@ def cmd_paths(cfg, paths, args):
     if info["on_monitored_volume"]:
         log("  note              : data folder is on the monitored volume; "
             "its subtree is excluded from scanning")
+    return 0
+
+
+def cmd_set_home(cfg, paths, args):
+    """Point the data folder at another volume (M1-7 option B).
+
+    The program can stay on C: while its few hundred megabytes of inventory and
+    event history live elsewhere -- on the one disk this tool is *not* supposed
+    to be part of. The choice is stored as a one-line pointer inside
+    %PROGRAMDATA%\\CDriveSentinel so the collector and the tray resolve it
+    through exactly the same rule (p1_config.read_home_pointer).
+
+    Nothing is moved here on purpose: relocating a live database behind the
+    user's back is how data gets lost. The command tells them what to move.
+    """
+    pointer = config.program_data_root() / config.HOME_POINTER
+
+    if args.clear:
+        try:
+            pointer.unlink()
+        except FileNotFoundError:
+            log("没有指针文件；数据目录已经是默认位置：%s" % config.program_data_root())
+            return 0
+        except OSError as exc:
+            log("删除 %s 失败（需要管理员权限）：%s" % (pointer, exc))
+            return 2
+        log("已删除指针，数据目录回到 %s" % config.program_data_root())
+        return 0
+
+    if not args.to:
+        log("用法：set-home --to <目录>    例如 set-home --to D:\\CDriveSentinelData")
+        log("      set-home --clear        回到默认位置（%%PROGRAMDATA%%\\%s）"
+            % config.APP_NAME)
+        return 2
+
+    target = Path(os.path.expandvars(args.to)).expanduser()
+    if not target.is_absolute():
+        log("必须写绝对路径，例如 D:\\CDriveSentinelData（收到：%s）" % args.to)
+        return 2
+    try:
+        for sub in ("config", "data", "data/logs", "data/snapshots",
+                    "reports/daily"):
+            (target / sub).mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        log("无法在 %s 创建目录：%s" % (target, exc))
+        return 2
+
+    drive = os.path.splitdrive(str(target))[0].upper()
+    mon = os.path.splitdrive(config.volume_root(cfg.get("volume") or "C:"))[0].upper()
+    if drive and mon and drive == mon:
+        log("注意：%s 位于监控盘 %s 上，工具自身的数据仍会占用它的空间。"
+            % (target, mon))
+        log("      该子目录会被自动排除，不会算成 C 盘增长，但空间是实占的。")
+
+    try:
+        pointer.parent.mkdir(parents=True, exist_ok=True)
+        tmp = pointer.with_name(pointer.name + ".tmp")
+        tmp.write_text(str(target) + "\n", encoding="utf-8")
+        os.replace(tmp, pointer)
+    except OSError as exc:
+        log("写入 %s 失败（需要管理员权限）：%s" % (pointer, exc))
+        return 2
+
+    log("数据目录已指向：%s" % target)
+    log("指针文件      ：%s" % pointer)
+    log("")
+    log("接下来：把已有数据搬到新目录（或在那边重新扫一次建立基线），")
+    log("然后重启后台任务，让它读到新位置。")
     return 0
 
 
@@ -2271,7 +2380,7 @@ def main(argv=None):
                         help="init-db | snapshot | heartbeat | daemon | report | "
                              "open-report | status | paths | scan-now | pause | "
                              "resume | runtime | selftest | usn-status | "
-                             "usn-poll | usn-index | prune | maintenance | setup")
+                             "usn-poll | usn-index | prune | maintenance | setup | set-home")
     parser.add_argument("--mode", default=None, help="alias for command (DESIGN.md style)")
     parser.add_argument("--config", default=None, help="path to config.json")
     parser.add_argument("--volume", default=None, help="override monitored volume")
@@ -2299,6 +2408,10 @@ def main(argv=None):
                         help="setup: accept defaults, never prompt")
     parser.add_argument("--no-start", action="store_true",
                         help="setup: do not request the first scan")
+    parser.add_argument("--to", default=None,
+                        help="set-home: absolute folder for config/ data/ reports/")
+    parser.add_argument("--clear", action="store_true",
+                        help="set-home: forget the pointer, back to ProgramData")
     parser.add_argument("--no-html", action="store_true", help="report: skip HTML")
     parser.add_argument("--max-records", type=int, default=None,
                         help="usn-poll: max raw records per poll")
@@ -2333,6 +2446,7 @@ def main(argv=None):
         "resume": cmd_resume,
         "runtime": cmd_runtime,
         "setup": cmd_setup,
+        "set-home": cmd_set_home,
         "selftest": cmd_selftest,
         "usn-status": cmd_usn_status,
         "usn-poll": cmd_usn_poll,

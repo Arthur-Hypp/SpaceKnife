@@ -118,6 +118,33 @@ def app_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+HOME_POINTER = "home.txt"
+
+
+def _programdata() -> Path:
+    return Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "CDriveSentinel"
+
+
+def _pointer_target():
+    """Data folder chosen at install time, or None.
+
+    Mirrors ``p1_config.read_home_pointer`` (this module must not import src/).
+    The installer uses it so the program can live on C: while its few hundred
+    megabytes of data stay on another volume.
+    """
+    f = _programdata() / HOME_POINTER
+    try:
+        raw = f.read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        return None
+    if not raw:
+        return None
+    target = Path(os.path.expandvars(raw)).expanduser()
+    if not target.is_absolute() or not target.is_dir():
+        return None
+    return target.resolve()
+
+
 def home() -> Path:
     """The folder holding ``config/`` and ``data/``.
 
@@ -128,9 +155,10 @@ def home() -> Path:
     keep them in the same order as src/p1_config.py:
 
       1. SENTINEL_HOME override
-      2. portable.txt beside the exe        -> program folder
-      3. installed build                    -> %PROGRAMDATA%\\CDriveSentinel
-      4. source run                         -> the repo root
+      2. installer pointer                  -> that folder (data off the disk)
+      3. portable.txt beside the exe        -> program folder
+      4. installed build                    -> %PROGRAMDATA%\\CDriveSentinel
+      5. source run                         -> the repo root
 
     An installed build no longer probes the folder next to the exe: a stray
     ``data/`` left over from a manual test used to win that lookup and feed the
@@ -141,10 +169,12 @@ def home() -> Path:
         return Path(os.path.expandvars(env)).expanduser().resolve()
     root = app_root()
     if getattr(sys, "frozen", False):
+        target = _pointer_target()
+        if target is not None:
+            return target
         if (root / "portable.txt").is_file():
             return root
-        prog = os.environ.get("PROGRAMDATA", r"C:\ProgramData")
-        return Path(prog) / "CDriveSentinel"
+        return _programdata()
     return root
 
 

@@ -251,6 +251,12 @@ CDriveSentinel_backup_*/
 # PyInstaller build artifacts (regenerate with build.py)
 CDriveSentinel/build/
 CDriveSentinel/dist/
+# build.py retires old artifacts as <name>.prev-<timestamp> instead of deleting
+# them. The plain build/ and dist/ rules above do not match those renamed
+# copies, so ignore them explicitly -- otherwise `git add -A` ships ~200 MB of
+# stale .pkg/.toc files. They stay on disk for the user to delete by hand.
+CDriveSentinel/build.prev-*/
+CDriveSentinel/dist/CDriveSentinel.prev-*/
 *.spec.bak
 # Keep the hand-written build spec (override GitHub's generic *.spec rule)
 !CDriveSentinel/CDriveSentinel.spec

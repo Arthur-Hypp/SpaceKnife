@@ -129,9 +129,19 @@ def main() -> int:
             shutil.copy2(src, DIST / doc)
     # The scheduled-task installer auto-detects the exe layout; ship it so the
     # distributed folder can register the daemon without the source tree.
-    installer = HERE / "install_task.ps1"
-    if installer.is_file():
-        shutil.copy2(installer, DIST / "install_task.ps1")
+    # Two scheduled tasks ship with the product: the elevated collector and the
+    # un-elevated logon popup. Both installers auto-detect the packaged layout.
+    for name in ("install_task.ps1", "install_popup_task.ps1"):
+        src = HERE / name
+        if src.is_file():
+            shutil.copy2(src, DIST / name)
+    # Script-mode installer: same folder, so setup.cmd works straight from the
+    # zip. install.ps1 detects that it is running inside the package and uses
+    # its own directory as the source.
+    for name in ("install.ps1", "setup.cmd"):
+        src = HERE / name
+        if src.is_file():
+            shutil.copy2(src, DIST / name)
     # Make tools/ exist so users know where to drop WizTree64.exe (optional).
     (DIST / "tools").mkdir(parents=True, exist_ok=True)
 
@@ -161,6 +171,13 @@ def main() -> int:
         "某个还留有旧 data\\ 的位置 —— 装到 Program Files 或用绿色版即可。\n\n"
         "若数据目录落在被监控的卷上（例如只有 C: 单盘），该子树会被扫描排除，\n"
         "避免把工具自身的写入算成 C 盘增长。\n\n"
+        "【推荐：一键安装，开机自动采集】\n"
+        "  右键 setup.cmd -> 以管理员身份运行：一路自动完成。\n"
+        "  它会把程序装到 Program Files，提示数据保存位置（建议选非 C: 盘），\n"
+        "  注册两个开机任务：后台采集 + 每天弹出昨天的日报，并让托盘随登录启动。\n"
+        "  卸载：以管理员身份运行 install.ps1 -Uninstall（默认保留历史数据）。\n"
+        "  想换数据盘：CDriveSentinel.exe set-home --to D:\\CDriveSentinelData\n"
+        "            然后手动把旧 data\\ 与 config\\ 拷过去、重启后台任务。\n\n"
         "以管理员身份运行可启用 USN 深读 / VSS 等完整功能。\n"
         "完整说明见 README.md，设计与计量口径见 docs/DESIGN.md。\n",
         encoding="utf-8")

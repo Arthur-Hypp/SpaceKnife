@@ -50,7 +50,7 @@ python src\main.py usn-status    # USN 权限 / journal / 游标诊断
 
 也可用 PowerShell 启动器：`powershell -ExecutionPolicy Bypass -File .\run_p1.ps1 status`。
 
-将守护进程注册为开机计划任务（需管理员）：`powershell -ExecutionPolicy Bypass -File .\install_task.ps1`（卸载加 `-Uninstall`）。
+将守护进程注册为开机计划任务（需管理员）：`powershell -ExecutionPolicy Bypass -File .\install_task.ps1`（卸载加 `-Uninstall`）。日报弹窗是另一个独立任务：`install_popup_task.ps1`（普通权限运行）。打包分发时两者由 `install.ps1` / `setup.cmd` 一次性注册（见下方"打包分发"）。
 
 ### 控制通道（托盘 ↔ 守护进程）
 
@@ -122,7 +122,10 @@ CDriveSentinel.exe selftest
 - 想做成"绿色版"（数据随程序走）：在 `CDriveSentinel.exe` 同目录放一个空的 `portable.txt`，数据就会退回 exe 旁边的 `config\`、`data\`。
 - 数据目录若落在被监控的卷上（典型是只有 C: 单盘的笔记本），该子树会被扫描排除，避免把工具自身的写入算成 C 盘增长。
 - 查看当前实际使用的目录：`CDriveSentinel.exe paths`。
-- 把守护进程注册为开机计划任务（需管理员）：在 exe 目录内运行 `powershell -ExecutionPolicy Bypass -File .\install_task.ps1`；卸载加 `-Uninstall`。脚本会自动识别 exe 版并以无窗口方式运行。
+- **一键安装（推荐，M1-7）**：双击 `setup.cmd` → 右键"以管理员身份运行"，一路自动完成：把程序装到 `C:\Program Files\CDriveSentinel\`、询问数据保存位置（默认选第一个非 C: 盘，避免工具自己占 C: 空间）、注册**两个开机任务**（提权的采集 `CDriveSentinel` + 普通权限的日报弹窗 `CDriveSentinel-OpenReport`）、让托盘随登录启动。卸载同样以管理员运行 `install.ps1 -Uninstall`（默认保留历史数据，加 `-PurgeData` 才删除）。
+  - 脚本安装器 `install.ps1` 与 Inno Setup 安装包 `CDriveSentinel.iss` 做的是同一件事；编译安装包用 `python make_installer.py`（需先装 Inno Setup 6）。
+  - 想换数据盘：`CDriveSentinel.exe set-home --to D:\CDriveSentinelData`（写 `%PROGRAMDATA%\CDriveSentinel\home.txt` 指针），然后手动把旧 `data\`/`config\` 拷过去、重启后台任务；`--clear` 回到默认位置。采集进程、托盘、CLI 通过同一套指针规则解析落点。
+  - 单独注册/卸载某个任务：`install_task.ps1`（采集，加 `-Uninstall`）、`install_popup_task.ps1`（日报弹窗，加 `-Uninstall`），都需管理员。
 - `CDriveSentinel.spec` / `build.py` 为构建配置；不需要的第三方模块已在 spec 中排除，未启用 UPX 压缩以避免杀毒误报。
 - 重复构建时旧产物不会被删除，而是改名为 `CDriveSentinel.prev-<时间戳>`（`build.py` 末尾会打印路径），确认新构建无误后自行删除即可。
 
