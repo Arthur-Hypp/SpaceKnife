@@ -34,6 +34,7 @@ C 盘空间变化实时监测与归因工具集。回答一个问题：**C 盘�
 在 `CDriveSentinel/` 目录下执行：
 
 ```powershell
+python src\main.py setup --yes   # 首次设置：档位 + 监控范围（不加 --yes 则交互问答）
 python src\main.py init-db       # 建库 + 首个心跳
 python src\main.py snapshot      # 手动跑一次快照 + 差分
 python src\main.py daemon        # 常驻：心跳 / USN / 快照 / 日报
@@ -53,7 +54,9 @@ python src\main.py usn-status    # USN 权限 / journal / 游标诊断
 
 ### 控制通道（托盘 ↔ 守护进程）
 
-托盘界面：`python gui\tray.py`（`--window` 启动即展开面板，`--smoke` 自检）。界面只读数据库，**只写 `runtime/`**，不需要管理员权限。
+托盘界面：`python gui\tray.py`（`--window` 启动即展开面板，`--smoke` 自检，`--wizard` 打开首次设置）。界面只读数据库，**只写 `runtime/`**，不需要管理员权限。
+
+**首次设置的三个选择**（`setup` 命令或向导里都一样）：监控范围（整盘 / 只监控用户文件夹）、占用档位（极简 320 / 标准 550 / 完整 800 MB）、是否开机自启。之后一切自动运行。`config.json` 里 `setup_complete: true` 表示已经配好，向导不再打扰；想重开向导用 `--wizard`。
 
 ```json
 { "paused": false, "request_scan": 1799999999.0, "by": "tray" }
@@ -75,11 +78,12 @@ python src\main.py usn-status    # USN 权限 / journal / 游标诊断
 | `exclude_paths` | 永不扫描的目录列表（绝对路径，或相对「数据根」）。数据目录若在监控卷上会自动加入；写进去的目录既不参与快照扫描，也不会进 USN 事件流 |
 | `skip_paths` | `exclude_paths` 的旧名字，仍然生效（两者合并使用） |
 | `snapshot_minutes` / `heartbeat_seconds` / `usn_poll_seconds` | 调度间隔 |
-| `max_scan_seconds` | 单次全盘扫描的时间预算（默认 2400）。**必须大于真实扫描时长**：超时的扫描在 L3 下不落库（partial 不能当基线），等于这个窗口没有数据。换机器后先看 `run.log` 里的 `elapsed`，乘 1.5 设定 |
+| `max_scan_seconds` | 单次全盘扫描的时间预算（默认 3000）。**必须大于真实扫描时长**：超时的扫描在 L3 下不落库（partial 不能当基线），等于这个窗口没有数据。守护进程每轮按最近 5 次完整扫描的中位数 ×1.5 自动上调（只升不降），正常不需要手改 |
 | `data_budget_mb` | **自身占盘硬上限**（默认 800）。超出时自动按「损失最小的先砍」收缩：旧归档 → USN 明细 → 可重建索引 → 清单 → 账本；`0` 关闭 |
 | `usn_retention_days` | USN 事件明细保留天数（默认 2）。报告只需要聚合数字，不需要 7 天逐条 |
 | `archive_retention_days` | 每日 gzip 归档保留天数（默认 2）。清单和账本已覆盖当前状态与每次变化，归档只是给外部工具的时间点副本 |
 | `mft_index_enabled` | 是否保留完整 MFT 索引（默认 `false`）。清单现在含目录行，父目录路径可直接解析；这份索引只在「两次扫描之间生灭的文件」上有用，实测为此花掉 159 MB |
+| `frn_path_map_enabled` | 是否保留「这个文件以前叫什么」的历史（默认 `true`，约 30 MB）。极简档关掉它，代价是两次扫描之间生灭的文件更容易落到 `unresolved` |
 | `alert_free_gb_below` / `alert_growth_gb_per_hour` | 告警阈值 |
 | `daily_report_hour` / `daily_report_top` | 日报生成时间与 Top N |
 
@@ -97,7 +101,14 @@ python -m pip install pyinstaller   # 仅构建时需要
 python build.py
 ```
 
-把整个 `dist/CDriveSentinel/` 文件夹拷到目标电脑即可运行（无需安装 Python）：
+把整个 `dist/CDriveSentinel/` 文件夹拷到目标电脑即可运行（无需安装 Python）。里面是**两个程序，共用一份 `_internal\` 运行时**：
+
+| 程序 | 形态 | 用途 |
+|---|---|---|
+| `SentinelTray.exe` | 窗口程序 | 双击即用：托盘图标 + 面板（可用空间、今日净增、Top 10、告警、7 天趋势、"立即扫描/暂停"） |
+| `CDriveSentinel.exe` | 控制台 | 采集进程与维护命令（见下） |
+
+日常使用只需要 `SentinelTray.exe`；它不需要管理员权限，也从不写数据库，只通过 `runtime\state.json` 向采集进程发通知。
 
 ```
 CDriveSentinel.exe status
@@ -107,11 +118,13 @@ CDriveSentinel.exe selftest
 
 - 采用 onedir 模式。**程序与数据分离**：安装后程序在 `C:\Program Files\CDriveSentinel\`，配置与数据在 `%PROGRAMDATA%\CDriveSentinel\`（首次运行自动生成 `config\config.json`，可编辑）。
 - 源码运行不受影响：配置与数据仍然写在项目文件夹内，路径与以前完全一致。
+- **界面与采集进程共用同一套落点规则**（`SENTINEL_HOME` → `portable.txt` → ProgramData → 项目目录），所以托盘读到的必然是采集进程写入的那份库。安装版不再"探测 exe 旁边有没有 `data/`"——那曾让界面读到一份已经停止写入的历史库。
 - 想做成"绿色版"（数据随程序走）：在 `CDriveSentinel.exe` 同目录放一个空的 `portable.txt`，数据就会退回 exe 旁边的 `config\`、`data\`。
 - 数据目录若落在被监控的卷上（典型是只有 C: 单盘的笔记本），该子树会被扫描排除，避免把工具自身的写入算成 C 盘增长。
 - 查看当前实际使用的目录：`CDriveSentinel.exe paths`。
 - 把守护进程注册为开机计划任务（需管理员）：在 exe 目录内运行 `powershell -ExecutionPolicy Bypass -File .\install_task.ps1`；卸载加 `-Uninstall`。脚本会自动识别 exe 版并以无窗口方式运行。
 - `CDriveSentinel.spec` / `build.py` 为构建配置；不需要的第三方模块已在 spec 中排除，未启用 UPX 压缩以避免杀毒误报。
+- 重复构建时旧产物不会被删除，而是改名为 `CDriveSentinel.prev-<时间戳>`（`build.py` 末尾会打印路径），确认新构建无误后自行删除即可。
 
 ## 代码签名（SignPath Foundation）
 

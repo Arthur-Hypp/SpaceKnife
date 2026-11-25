@@ -38,6 +38,8 @@ from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QMenu,
 
 import control_client
 import datafeed
+import setup_client
+from setup_wizard import SetupWizard
 
 NOTE_DEFAULT = "只读监控 · 界面只写 runtime/，从不写库"
 
@@ -577,7 +579,12 @@ class Dashboard(QWidget):
         self.setWindowIcon(make_icon(icon_state, d.capacity.used_ratio))
 
         last = datafeed.ago(d.capacity.ts or d.snapshot.ts, d.refreshed)
-        if d.paused:
+        if d.pending:
+            # Fresh install: no database yet. Say what is happening instead of
+            # "心跳 -- · 每 30 分钟一次", which reads like a broken install.
+            self.subtitle.setText(
+                "C: 尚未开始采集 · 守护进程完成首次扫描后会自动显示数据")
+        elif d.paused:
             self.subtitle.setText("C: 只读监控 · 已暂停 · 采集进程跳过调度")
         elif d.snapshot.scanning:
             self.subtitle.setText("C: 只读监控 · 正在扫描（%s 开始）· 每 %d 分钟一次"
@@ -601,11 +608,16 @@ class Dashboard(QWidget):
             badge="低于告警线" if low else "")
 
         net_color = RED if d.today.net > 0 else (GREEN if d.today.net < 0 else TEXT)
-        self.card_today.set(
-            datafeed.size(d.today.net, True),
-            "新增 %s · 移出 %s"
-            % (datafeed.size(d.today.added), datafeed.size(abs(d.today.removed))),
-            color=net_color)
+        if d.pending:
+            # No database yet: "0 B" would read as "nothing changed today" when
+            # the truth is "nothing has been measured yet".
+            self.card_today.set("--", "首次扫描完成后开始统计", color=MUT)
+        else:
+            self.card_today.set(
+                datafeed.size(d.today.net, True),
+                "新增 %s · 移出 %s"
+                % (datafeed.size(d.today.added), datafeed.size(abs(d.today.removed))),
+                color=net_color)
         self.top_hint.setText("%s 条事件 · 按一级目录聚合"
                               % format(d.today.events, ","))
 
@@ -856,7 +868,56 @@ class TrayController(QObject):
 
 # ------------------------------------------------------------------ main
 
+def _ensure_streams() -> None:
+    """Give a windowed build somewhere to write.
+
+    PyInstaller's windowed mode starts the process with ``sys.stdout`` and
+    ``sys.stderr`` set to None. Any ``print`` -- including one inside an
+    exception handler -- then raises ``AttributeError: 'NoneType' object has no
+    attribute 'write'``, so a crash that should have been logged instead kills
+    the tray with no trace anywhere. Redirect to a file under the data folder;
+    if even that fails, devnull.
+    """
+    if sys.stdout is not None and sys.stderr is not None:
+        return
+    target = None
+    try:
+        logs = datafeed.home() / "logs"
+        logs.mkdir(parents=True, exist_ok=True)
+        target = (logs / "tray.log").open("a", encoding="utf-8", buffering=1)
+    except OSError:
+        try:
+            target = open(os.devnull, "w", encoding="utf-8")
+        except OSError:
+            return
+    if sys.stdout is None:
+        sys.stdout = target
+    if sys.stderr is None:
+        sys.stderr = target
+
+
+def _install_crash_hook() -> None:
+    """Write unhandled exceptions to the same log.
+
+    A windowed process has no console, so an exception in a slot used to end the
+    process with nothing written anywhere. One traceback in tray.log turns
+    "它自己就没了" into something diagnosable.
+    """
+    def hook(exc_type, exc, tb):
+        try:
+            import traceback
+            sys.stderr.write("---- %s ----\n"
+                             % dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+            traceback.print_exception(exc_type, exc, tb, file=sys.stderr)
+            sys.stderr.flush()
+        except Exception:
+            pass
+    sys.excepthook = hook
+
+
 def main(argv: list[str]) -> int:
+    _ensure_streams()
+    _install_crash_hook()
     shot = None
     show_window = "--window" in argv
     if "--shot" in argv:
@@ -882,9 +943,13 @@ def main(argv: list[str]) -> int:
         app._guard = guard  # keep the segment alive for the process lifetime
 
     if shot:
-        win = Dashboard(None)
-        win.resize(1040, 720)
+        if "--wizard" in argv:
+            win = SetupWizard()
+        else:
+            win = Dashboard(None)
+            win.resize(1040, 720)
         win.show()
+        win.adjustSize()
         app.processEvents()
 
         def grab() -> None:
@@ -919,7 +984,30 @@ def main(argv: list[str]) -> int:
         return app.exec()
 
     tray = TrayController(app)
-    if tray.available:
+
+    # First run: one page, three answers, then it runs unattended (M1-6).
+    # Declining is allowed -- the tray still works, it just shows "等待数据" and
+    # the wizard comes back next launch.
+    if "--wizard" in argv or not setup_client.is_configured():
+        wizard = SetupWizard()
+        app._wizard = wizard          # keep it alive; otherwise Qt drops it
+
+        def after_setup(ok: bool) -> None:
+            if not ok:
+                return
+            try:
+                # Ask for the first scan now so the panel fills up without the
+                # user having to know a daemon exists.
+                control_client.request_scan(datafeed.find_db())
+            except Exception:
+                pass
+            tray.refresh()
+
+        wizard.finished.connect(after_setup)
+        wizard.show()
+        if show_window:
+            tray.show_window()
+    elif tray.available:
         if show_window:
             tray.show_window()
     else:

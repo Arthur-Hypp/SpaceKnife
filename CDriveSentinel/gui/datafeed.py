@@ -259,12 +259,19 @@ class Dashboard:
     free_alert_gb: float = 10.0
     error: str = ""
     paused: bool = False                            # control channel (M1-5)
+    pending: bool = False                           # db not created yet (fresh install)
+    note: str = ""                                  # extra subtitle for pending
 
     # ---- derived state for the tray icon / pill
     @property
     def state(self) -> str:
         if self.error:
             return "error"
+        # A database that does not exist yet is NOT an error: the collector has
+        # simply not finished its first scan. Showing "读取失败" here made a
+        # healthy fresh install look broken.
+        if self.pending:
+            return "unknown"
         if self.paused:
             return "paused"
         if self.snapshot.scanning:
@@ -338,8 +345,21 @@ def load(db: Path | None = None, now: dt.datetime | None = None) -> Dashboard:
     dash.free_alert_gb = float(cfg.get("alert_free_gb_below") or 10.0)
     dash.paused = _paused_state(db)
 
+    # Fill in the real volume capacity BEFORE any early return. Every path that
+    # bails out (no database, unreadable database) used to leave capacity at its
+    # zero default, and the card rendered a red "0 B · below threshold" -- on a
+    # brand-new install that is the first and only thing a user sees, and it
+    # reads as "your disk is full".
+    live = _live_capacity(cfg.get("volume") or "C:")
+    if live is not None:
+        dash.capacity = live
+
     if not db.is_file():
-        dash.error = "找不到数据库：%s" % db
+        # Expected on a fresh install: the collector has not written yet. Not an
+        # error -- the pill says "等待数据" and the subtitle explains why.
+        dash.pending = True
+        dash.note = ("尚未开始采集：%s\n后台守护进程完成首次扫描后，这里会自动出现数据。"
+                     % db)
         return dash
 
     try:
@@ -353,12 +373,9 @@ def load(db: Path | None = None, now: dt.datetime | None = None) -> Dashboard:
                         "FROM volume_heartbeat ORDER BY id DESC LIMIT 1")
         if rows:
             ts, total, used, free = rows[0]
-            dash.capacity = Capacity(int(total or 0), int(used or 0), int(free or 0), ts or "")
-        if not dash.capacity.total:
-            # No heartbeat yet (fresh install): fall back to the live volume.
-            live = _live_capacity(cfg.get("volume") or "C:")
-            if live is not None:
-                dash.capacity = live
+            if total:
+                dash.capacity = Capacity(int(total or 0), int(used or 0),
+                                         int(free or 0), ts or "")
 
         # last *completed* snapshot (heartbeat-only rows have NULL file_count)
         rows = _q(conn, "SELECT ts_local, elapsed_seconds, partial, file_count "

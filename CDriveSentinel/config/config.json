@@ -38,5 +38,9 @@
     "exe": "tools/WizTree64.exe",
     "note": "P1 diffs by NTFS file ID; WizTree CSV has no FRN column, so P1 uses the built-in scanner."
   },
-  "mft_index_enabled": false
+  "mft_index_enabled": false,
+  "setup_complete": true,
+  "setup_profile": "custom",
+  "setup_at": "2026-11-25 09:52:12",
+  "frn_path_map_enabled": true
 }

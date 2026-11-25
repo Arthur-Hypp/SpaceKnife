@@ -41,6 +41,30 @@ def signed(num):
     return ("+" if num >= 0 else "-") + human(abs(num))
 
 
+def _short_path(path, head=24, tail=36):
+    """Keep the drive/head and the file name (tail) visible in a narrow cell."""
+    path = path or ""
+    if len(path) <= head + tail + 3:
+        return path
+    return path[:head] + "..." + path[-tail:]
+
+
+def _path_cell(full, uid, colspan):
+    """Build a compact path cell plus its hidden full-path detail row."""
+    full = full or ""
+    short = _short_path(full)
+    cell = ("<td class='path-cell'><div class='path-line'>"
+            "<code title='%s'>%s</code>"
+            "<button type='button' class='path-toggle' data-target='pd%d'>展开</button>"
+            "</div></td>" % (html.escape(full), html.escape(short), uid))
+    detail = ("<tr class='path-detail' id='pd%d' hidden><td colspan='%d'>"
+              "<div class='detail-line'><code class='full-path'>%s</code>"
+              "<button type='button' class='path-copy' data-path='%s'>复制路径</button>"
+              "</div></td></tr>" %
+              (uid, colspan, html.escape(full), html.escape(full)))
+    return cell, detail
+
+
 def _bounds(day, since, until):
     if since or until:
         start = (since or "1970-01-01").strip()
@@ -385,6 +409,12 @@ def render_html(data):
     e = html.escape
     parts = []
     add = parts.append
+    counter = [0]
+
+    def next_id():
+        counter[0] += 1
+        return counter[0]
+
     add("<!DOCTYPE html><html lang='zh-CN'><head><meta charset='utf-8'>")
     add("<title>CDriveSentinel P1 日报 %s</title>" % e(data["start"][:10]))
     add("""<style>
@@ -401,6 +431,27 @@ th{background:#f3f5f9;color:#4b5563;font-weight:600}
 td.num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
 .pos{color:#c0392b;font-weight:600}.neg{color:#1e8449;font-weight:600}
 code{background:#f3f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
+table.path-table{table-layout:fixed}
+.path-table th.col-delta{width:100px}
+.path-table th.col-op{width:72px}
+.path-table th.col-time{width:150px}
+.path-table th.col-reason{width:130px}
+.path-table td{overflow-wrap:anywhere}
+.path-cell .path-line{display:flex;align-items:center;gap:6px;min-width:0}
+.path-cell code{flex:0 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;
+                white-space:nowrap;background:transparent;padding:0}
+.path-toggle{flex:none;border:1px solid #d9dee7;background:#fff;color:#3b6cff;
+             border-radius:4px;padding:1px 6px;font-family:inherit;font-size:12px;cursor:pointer}
+.path-toggle:hover{background:#eef2f8}
+.path-detail[hidden]{display:none}
+.path-detail td{background:#f8fafc;overflow-wrap:anywhere;padding-left:50px}
+.detail-line{display:flex;align-items:flex-start;gap:12px}
+.path-detail code.full-path{flex:1;min-width:0;display:block;white-space:normal;overflow-wrap:anywhere;
+                            word-break:break-all;background:transparent;padding:0}
+.path-copy{flex:none;border:1px solid #d9dee7;background:#fff;color:#4b5563;border-radius:4px;
+           padding:2px 8px;font-family:inherit;font-size:12px;cursor:pointer}
+.path-copy:hover{background:#eef2f8}
+@media print{.path-toggle,.path-copy{display:none}}
 .note{background:#fff8e6;border:1px solid #f2d998;border-radius:8px;padding:10px 14px;
       font-size:13px;color:#7a5b12}
 .bar{background:#eef1f5;border-radius:3px;width:140px;overflow:hidden}
@@ -491,10 +542,12 @@ code{background:#f3f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
 
         add("<div class='tab-panel' data-i='1' role='tabpanel'>")
         if w["winners"]:
-            add("<table><tr><th>变化</th><th>操作</th><th>路径</th></tr>")
+            add("<table class='path-table'><tr><th class='col-delta'>变化</th>"
+                "<th class='col-op'>操作</th><th>路径</th></tr>")
             for f in w["winners"]:
-                add("<tr><td class='num pos'>%s</td><td>%s</td><td><code>%s</code></td></tr>" %
-                    (signed(f["delta_bytes"]), e(f["op"]), e(f["path"])))
+                cell, detail = _path_cell(f["path"], next_id(), 3)
+                add("<tr><td class='num pos'>%s</td><td>%s</td>%s</tr>%s" %
+                    (signed(f["delta_bytes"]), e(f["op"]), cell, detail))
             add("</table>")
         else:
             add("<div class='meta'>本时段无增长文件。</div>")
@@ -502,10 +555,12 @@ code{background:#f3f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
 
         add("<div class='tab-panel' data-i='2' role='tabpanel'>")
         if w["losers"]:
-            add("<table><tr><th>变化</th><th>操作</th><th>路径</th></tr>")
+            add("<table class='path-table'><tr><th class='col-delta'>变化</th>"
+                "<th class='col-op'>操作</th><th>路径</th></tr>")
             for f in w["losers"]:
-                add("<tr><td class='num neg'>%s</td><td>%s</td><td><code>%s</code></td></tr>" %
-                    (signed(f["delta_bytes"]), e(f["op"]), e(f["path"])))
+                cell, detail = _path_cell(f["path"], next_id(), 3)
+                add("<tr><td class='num neg'>%s</td><td>%s</td>%s</tr>%s" %
+                    (signed(f["delta_bytes"]), e(f["op"]), cell, detail))
             add("</table>")
         else:
             add("<div class='meta'>本时段无释放文件。</div>")
@@ -554,11 +609,13 @@ code{background:#f3f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
                 add("<tr><td><code>%s</code></td><td class='num'>%s</td></tr>" %
                     (e(r["top_dir"] or ""), r["n"]))
             add("</table>")
-        add("<table><tr><th>时间</th><th>操作</th><th>原因</th><th>路径</th></tr>")
+        add("<table class='path-table'><tr><th class='col-time'>时间</th>"
+            "<th class='col-op'>操作</th><th class='col-reason'>原因</th><th>路径</th></tr>")
         for r in u["recent"]:
-            add("<tr><td>%s</td><td>%s</td><td>%s</td><td><code>%s</code></td></tr>" %
+            cell, detail = _path_cell(r["path"], next_id(), 4)
+            add("<tr><td>%s</td><td>%s</td><td>%s</td>%s</tr>%s" %
                 (e(r["time_local"] or "-"), e(r["op"]),
-                 e(r["reason_names"] or ""), e(r["path"] or "")))
+                 e(r["reason_names"] or ""), cell, detail))
         add("</table>")
 
     if data["alerts"]:
@@ -572,7 +629,28 @@ code{background:#f3f5f9;padding:1px 5px;border-radius:4px;font-size:12px}
     add("<div class='meta'>CDriveSentinel P1 · 报告数据：data/sentinel.db · 逐事件日志：data/logs/YYYY-MM-DD.jsonl</div>")
     add("""<script>
 document.addEventListener('click', function(ev) {
-  var btn = ev.target.closest ? ev.target.closest('.tab-btn') : null;
+  var t = ev.target;
+  var toggle = t.closest ? t.closest('.path-toggle') : null;
+  if (toggle) {
+    var detail = document.getElementById(toggle.getAttribute('data-target'));
+    if (!detail) return;
+    detail.hidden = !detail.hidden;
+    toggle.textContent = detail.hidden ? '展开' : '收起';
+    return;
+  }
+  var copy = t.closest ? t.closest('.path-copy') : null;
+  if (copy) {
+    var text = copy.getAttribute('data-path') || '';
+    var done = function() { var old = copy.textContent; copy.textContent = '已复制';
+      setTimeout(function() { copy.textContent = old; }, 1500); };
+    var fail = function() { var old = copy.textContent; copy.textContent = '复制失败';
+      setTimeout(function() { copy.textContent = old; }, 1500); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function() { legacyCopy(text, done, fail); });
+    } else { legacyCopy(text, done, fail); }
+    return;
+  }
+  var btn = t.closest ? t.closest('.tab-btn') : null;
   if (!btn || btn.disabled) return;
   var box = btn.closest('.tabbox');
   if (!box) return;
@@ -583,6 +661,18 @@ document.addEventListener('click', function(ev) {
   for (var j = 0; j < panels.length; j++)
     panels[j].classList.toggle('active', panels[j].getAttribute('data-i') === idx);
 });
+function legacyCopy(text, done, fail) {
+  var ta = document.createElement('textarea');
+  ta.value = text;
+  ta.style.position = 'absolute';
+  ta.style.left = '-9999px';
+  document.body.appendChild(ta);
+  ta.select();
+  var ok = false;
+  try { ok = document.execCommand('copy'); } catch (err) { ok = false; }
+  document.body.removeChild(ta);
+  if (ok) done(); else fail();
+}
 </script>""")
     add("</div></body></html>")
     return "\n".join(parts) + "\n"

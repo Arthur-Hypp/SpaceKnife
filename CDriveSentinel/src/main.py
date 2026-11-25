@@ -28,6 +28,7 @@ import csv
 import datetime
 import gzip
 import json
+import math
 import os
 import shutil
 import sys
@@ -290,6 +291,55 @@ def do_snapshot(conn, cfg, paths, vol=None, do_diff=True, progress=True,
     return {"snapshot_id": sid, "stats": stats, "diff": result,
             "csv_path": str(csv_path) if csv_path else None,
             "paths": paths, "cfg": cfg, "conn": conn}
+
+
+def calibrate_scan_budget(conn, cfg, paths, config_path=None):
+    """Raise ``max_scan_seconds`` when real scans need more time than allowed.
+
+    Why this lives in the daemon and not in the first-run wizard: the right
+    number depends on how many files the disk holds and how fast it reads, and
+    nothing can know that before a scan has actually run. A budget that is too
+    small is not a graceful degradation -- since L3 a partial scan stores
+    nothing, so exceeding it silently costs an entire diff window (observed on
+    2026-11-24: 1.08M staged rows discarded, inventory stuck one snapshot back).
+
+    Only ever raises the number. A single slow pass (antivirus, another backup
+    running) is not a reason to shrink it, and a budget that is too generous
+    merely means a pathological scan takes longer before giving up.
+
+    Persists exactly one key, so anything the user edited by hand survives.
+    """
+    rows = conn.execute(
+        "SELECT elapsed_seconds FROM snapshot_meta "
+        "WHERE partial=0 AND file_count>0 AND elapsed_seconds>0 "
+        "ORDER BY id DESC LIMIT 5").fetchall()
+    if len(rows) < 2:
+        return None
+    times = sorted(float(r[0]) for r in rows)
+    median = times[len(times) // 2]
+    budget = float(cfg.get("max_scan_seconds") or 0)
+    if budget <= 0:
+        return None
+    want = int(math.ceil(median * 1.5 / 300.0) * 300)
+    if want <= budget:
+        return None
+    disk = config.load_config(config_path)
+    disk["max_scan_seconds"] = want
+    try:
+        config.save_config(disk, config_path)
+    except OSError as exc:
+        log("  budget: could not save max_scan_seconds=%d (%s)" % (want, exc))
+        return None
+    cfg["max_scan_seconds"] = want          # this process too, no restart
+    log("  budget: median scan %.0fs needed more than the %.0fs budget; "
+        "raised max_scan_seconds to %ds" % (median, budget, want))
+    try:
+        db.add_alert(conn, "info", "scan_budget",
+                     "median scan %.0fs; scan budget raised to %ds"
+                     % (median, want), median)
+    except Exception:
+        pass
+    return want
 
 
 def cmd_init_db(cfg, paths, args):
@@ -726,9 +776,11 @@ def cmd_daemon(cfg, paths, args):
                              "C: free %.2f GiB, extra snapshot triggered" % free_gb, free_gb)
                 due = True
             if due or manual:
+                scanned = False
                 try:
                     do_snapshot(conn, cfg, paths, vol=vol,
                                 should_stop=_pause_probe(paths))
+                    scanned = True
                 except Exception as exc:
                     log("snapshot FAILED (daemon continues): %s: %s" %
                         (type(exc).__name__, exc))
@@ -742,6 +794,14 @@ def cmd_daemon(cfg, paths, args):
                                      "%.3f" % last_scan_request)
                     except Exception:
                         pass
+                if scanned:
+                    # Keep the budget honest against this machine's real speed.
+                    # Never allowed to fail the loop.
+                    try:
+                        calibrate_scan_budget(conn, cfg, paths)
+                    except Exception as exc:
+                        log("budget calibration skipped: %s: %s" %
+                            (type(exc).__name__, exc))
             if args.once:
                 break
             if args.max_runtime and time.monotonic() - started >= args.max_runtime:
@@ -1301,6 +1361,138 @@ def _make_usn_record(major, frn, parent, usn_no, ft, reason, name):
     return struct.pack("<I", len(body)) + body[4:]
 
 
+def _ask_choice(title, options, default_index=0):
+    """One numbered question. *options* is [(key, label, note), ...]."""
+    print()
+    print(title)
+    for i, (_key, label, note) in enumerate(options, 1):
+        print("  %d) %s" % (i, label))
+        if note:
+            print("     %s" % note)
+    while True:
+        try:
+            raw = input("  请选择 [1-%d，直接回车 = %d]: "
+                        % (len(options), default_index + 1)).strip()
+        except EOFError:
+            return options[default_index][0]
+        if not raw:
+            return options[default_index][0]
+        if raw.isdigit() and 1 <= int(raw) <= len(options):
+            return options[int(raw) - 1][0]
+        print("  请输入 1 到 %d 之间的数字。" % len(options))
+
+
+def _owner_scope(cfg):
+    """Scope covering this user's profile folder, or None if it is off-volume."""
+    drive = config.volume_root(cfg.get("volume") or "C:")[:2].upper()
+    try:
+        home = Path.home().resolve()
+    except OSError:
+        return None
+    if home.drive.upper() != drive:
+        return None
+    return str(home)
+
+
+def cmd_setup(cfg, paths, args):
+    """First-run setup: pick a footprint profile and a scan scope, then save.
+
+    This is the part of M1-6 that does not need a window: the GUI calls the same
+    logic, and an installer can run it silently with --profile/--scope/--yes.
+    Three answers are enough to make the tool work unattended, which is the
+    milestone's acceptance criterion.
+    """
+    cfg_file = paths["config"] / "config.json"
+    interactive = (not args.profile and not args.area and not args.yes
+                   and sys.stdin.isatty())
+
+    print("=" * 58)
+    print(" CDriveSentinel 首次设置")
+    print("=" * 58)
+    print(" 数据目录：%s" % paths["data"])
+    if cfg_file.is_file():
+        print(" 已存在配置，本次只修改所选项目。")
+
+    profiles = list(config.PROFILES.items())
+    profile = args.profile
+    if not profile and interactive:
+        profile = _ask_choice(
+            "① 占用多少 C 盘空间（只影响保留多久的历史）",
+            [(key, "%s（上限约 %d MB）" % (val["label"], val["data_budget_mb"]),
+              val["note"]) for key, val in profiles],
+            default_index=[k for k, _ in profiles].index(config.DEFAULT_PROFILE))
+    profile = profile or config.DEFAULT_PROFILE
+    if profile not in config.PROFILES:
+        log("未知档位 %r，可选：%s" % (profile, "、".join(config.PROFILES)))
+        return 2
+
+    scope_mode = args.area
+    owner = _owner_scope(cfg)
+    if not scope_mode and interactive:
+        scope_options = [("full", "整盘 %s" % (cfg.get("volume") or "C:"),
+                          "能看到所有变化（推荐）。首次扫描约 20–30 分钟。")]
+        if owner:
+            scope_options.append(
+                ("user", "只监控我的用户文件夹", "扫描快很多，但 Windows、"
+                 "ProgramData 等位置的增长会看不到。"))
+        scope_mode = _ask_choice("② 监控哪里", scope_options, default_index=0)
+    scope_mode = scope_mode or "full"
+
+    # Start from what is on disk, so hand-edited keys and the user's earlier
+    # choices (thresholds, exclusions, schedule) are preserved.
+    disk = config.load_config()
+    new_cfg = config.apply_profile(disk, profile)
+
+    if scope_mode == "user":
+        if not owner:
+            log("无法使用「只监控用户文件夹」：用户目录不在 %s 盘上。"
+                % (cfg.get("volume") or "C:"))
+            return 2
+        new_cfg["scope"] = [owner]
+        scope_text = owner
+    elif scope_mode == "full":
+        new_cfg["scope"] = []
+        scope_text = config.volume_root(cfg.get("volume") or "C:") + "（整盘）"
+    else:
+        log("未知范围 %r，可选：full、user" % scope_mode)
+        return 2
+
+    new_cfg["data_root"] = disk.get("data_root", ".")
+    new_cfg["setup_complete"] = True
+    new_cfg["setup_at"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    new_cfg["setup_profile"] = profile
+
+    try:
+        saved = config.save_config(new_cfg)
+    except OSError as exc:
+        log("写入配置失败：%s" % exc)
+        log("（数据目录不可写？安装版需要管理员权限来写 %s）" % paths["data"])
+        return 2
+
+    prof = config.PROFILES[profile]
+    print()
+    print("-" * 58)
+    print(" 档位    ：%s（上限约 %d MB）" % (prof["label"], prof["data_budget_mb"]))
+    print(" 监控范围：%s" % scope_text)
+    print(" 首次扫描预算：%d 秒（会根据实际耗时自动上调）"
+          % int(new_cfg.get("max_scan_seconds") or 0))
+    print(" 配置已写入：%s" % saved)
+
+    if not args.no_start:
+        try:
+            control.request_scan(paths, by="setup")
+            print(" 已请求首次扫描：后台程序启动后会立刻开始。")
+        except Exception as exc:
+            print(" 请求首次扫描失败（不影响配置）：%s" % exc)
+
+    print()
+    print("下一步：让它在后台跑起来（需要管理员权限一次）")
+    print("  powershell -ExecutionPolicy Bypass -File install_task.ps1")
+    print("日常查看：双击 SentinelTray.exe")
+    print("-" * 58)
+    return 0
+
+
 def cmd_selftest(cfg, paths, args):
     """End-to-end diff verification using a sandbox on D:, never touching C:."""
     sandbox = paths["root"] / "data" / "selftest"
@@ -1452,6 +1644,81 @@ def cmd_selftest(cfg, paths, args):
     check("an exclusion that contains a scan root is ignored",
           config.exclude_prefixes(guard_cfg, sp) == [],
           "would have emptied the scan")
+
+    # ---- M1-6: first-run setup, footprint profiles, budget calibration ----
+    # A profile may only touch the footprint keys; anything the user set by hand
+    # (thresholds, schedule, scope, exclusions) has to survive a profile switch.
+    user_cfg = dict(scfg)
+    user_cfg.update({"alert_free_gb_below": 7, "snapshot_minutes": 45,
+                     "scope": ["X:\\keep"], "exclude_paths": ["X:\\skip"]})
+    for name in sorted(config.PROFILES):
+        prof = config.apply_profile(user_cfg, name)
+        want = config.PROFILES[name]
+        same = all(prof[k] == want[k] for k in config.PROFILE_KEYS if k in want)
+        kept = (prof["alert_free_gb_below"] == 7 and prof["snapshot_minutes"] == 45
+                and prof["scope"] == ["X:\\keep"]
+                and prof["exclude_paths"] == ["X:\\skip"])
+        check("M1-6 profile %s applies and keeps user settings" % name,
+              same and kept,
+              "budget=%s usn=%s alert=%s" % (prof["data_budget_mb"],
+                                             prof["usn_retention_days"],
+                                             prof["alert_free_gb_below"]))
+    try:
+        config.apply_profile(user_cfg, "nope")
+        bad_profile_rejected = False
+    except ValueError:
+        bad_profile_rejected = True
+    check("M1-6 an unknown profile is rejected", bad_profile_rejected)
+
+    save_cfg = dict(user_cfg)
+    save_cfg["_config_path"] = "runtime-only"
+    save_cfg["setup_complete"] = True
+    cfg_probe = sandbox / "config"
+    cfg_probe.mkdir(parents=True, exist_ok=True)
+    save_path = cfg_probe / "setup_test.json"
+    config.save_config(save_cfg, save_path)
+    written = json.loads(save_path.read_text(encoding="utf-8"))
+    check("M1-6 config save is atomic and drops runtime keys",
+          "_config_path" not in written
+          and "_comment" in written
+          and written["setup_complete"] is True
+          and not save_path.with_name(save_path.name + ".tmp").exists(),
+          "keys=%s" % sorted(k for k in written if k.startswith("_")))
+
+    bconn = db.connect(sp["data"] / "budget_probe.db")
+    db.init_schema(bconn)
+    bconn.executemany(
+        """INSERT INTO snapshot_meta
+           (ts_utc, ts_local, source, root, scope_hash, partial, used_bytes,
+            free_bytes, total_bytes, cluster_size, file_count, elapsed_seconds)
+           VALUES ('', ?, 'x', 'C:\\', 'h', ?, 0, 0, 0, 4096, 1000, ?)""",
+        [("2026-11-25 09:00:00", 0, 2000.0),
+         ("2026-11-25 09:30:00", 0, 2100.0),
+         ("2026-11-25 10:00:00", 0, 2050.0)])
+    bconn.commit()
+    bpath = cfg_probe / "budget_check.json"
+    bcfg = dict(scfg)
+    bcfg["max_scan_seconds"] = 3000
+    raised = calibrate_scan_budget(bconn, bcfg, sp, bpath)
+    stored = json.loads(bpath.read_text(encoding="utf-8"))
+    check("M1-6 budget is raised above the median real scan",
+          raised == 3300 and bcfg["max_scan_seconds"] == 3300
+          and stored["max_scan_seconds"] == 3300,
+          "raised=%s stored=%s" % (raised, stored.get("max_scan_seconds")))
+    check("M1-6 budget calibration is idempotent",
+          calibrate_scan_budget(bconn, bcfg, sp, bpath) is None)
+
+    # A timed-out scan must never justify a bigger budget: it measured nothing.
+    bconn.execute(
+        """INSERT INTO snapshot_meta
+           (ts_utc, ts_local, source, root, scope_hash, partial, used_bytes,
+            free_bytes, total_bytes, cluster_size, file_count, elapsed_seconds)
+           VALUES ('', '2026-11-25 10:30:00', 'x', 'C:\\', 'h', 1, 0, 0, 0, 4096,
+                   900, 99999.0)""")
+    bconn.commit()
+    check("M1-6 partial scans do not inflate the budget",
+          calibrate_scan_budget(bconn, bcfg, sp, bpath) is None)
+    bconn.close()
 
     # ---- M1-5: control channel (state file + scheduling decisions) -------
     rt = control.runtime_dir(sp)
@@ -2004,7 +2271,7 @@ def main(argv=None):
                         help="init-db | snapshot | heartbeat | daemon | report | "
                              "open-report | status | paths | scan-now | pause | "
                              "resume | runtime | selftest | usn-status | "
-                             "usn-poll | usn-index | prune | maintenance")
+                             "usn-poll | usn-index | prune | maintenance | setup")
     parser.add_argument("--mode", default=None, help="alias for command (DESIGN.md style)")
     parser.add_argument("--config", default=None, help="path to config.json")
     parser.add_argument("--volume", default=None, help="override monitored volume")
@@ -2022,6 +2289,16 @@ def main(argv=None):
     parser.add_argument("--since", default=None, help="report: local start time")
     parser.add_argument("--until", default=None, help="report: local end time")
     parser.add_argument("--top", type=int, default=10, help="report: Top N")
+    parser.add_argument("--profile", default=None,
+                        choices=sorted(config.PROFILES),
+                        help="setup: footprint profile (%s)"
+                             % " | ".join(sorted(config.PROFILES)))
+    parser.add_argument("--area", default=None, choices=("full", "user"),
+                        help="setup: scan the whole volume or only this user's folder")
+    parser.add_argument("--yes", action="store_true",
+                        help="setup: accept defaults, never prompt")
+    parser.add_argument("--no-start", action="store_true",
+                        help="setup: do not request the first scan")
     parser.add_argument("--no-html", action="store_true", help="report: skip HTML")
     parser.add_argument("--max-records", type=int, default=None,
                         help="usn-poll: max raw records per poll")
@@ -2055,6 +2332,7 @@ def main(argv=None):
         "pause": cmd_pause,
         "resume": cmd_resume,
         "runtime": cmd_runtime,
+        "setup": cmd_setup,
         "selftest": cmd_selftest,
         "usn-status": cmd_usn_status,
         "usn-poll": cmd_usn_poll,

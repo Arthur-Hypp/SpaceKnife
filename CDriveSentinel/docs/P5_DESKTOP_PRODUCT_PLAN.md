@@ -223,9 +223,9 @@
 | M1-1 | `p1_config` 三目录分离：新增 `install_dir()` / `data_dir()` / `config_dir()`；冻结态读 `%PROGRAMDATA%\CDriveSentinel`，源码态行为不变 | `selftest` 全绿；源码态路径与现在完全一致 |
 | M1-2 | 扫描排除清单化：`exclude_paths` 默认含数据目录；修正 `skip_paths` 语义（扫描排除 + 差异忽略） | 自检新增"自产数据目录不被计入"用例 |
 | M1-3 | 旧数据迁移：检测 exe 旁 `data/`，首启提示导入（只读拷贝，不删旧目录） | 旧机器升级后历史快照仍在 |
-| M1-4 | `SentinelTray.exe`（PySide6）：托盘菜单、状态灯、今日 Top 10、单实例互斥、右键"打开报告/立即扫描/暂停/退出" | 双击托盘 3 秒内出今日数据；重复启动不产生第二实例 |
+| M1-4 | `SentinelTray.exe`（PySide6）：托盘菜单、状态灯、今日 Top 10、单实例互斥、右键"打开报告/立即扫描/暂停/退出" | 双击托盘 3 秒内出今日数据；重复启动不产生第二实例（已打包进 dist，见 10.8） |
 | M1-5 | 控制通道：GUI 写 `runtime/state.json` + 命名事件唤醒 daemon；GUI 零提权 | 点"立即扫描"能在 30 秒内触发，且不弹 UAC |
-| M1-6 | 首启向导（简版）：监控盘、数据目录、快速/全盘模式、开机自启 | 三项选择后即可全自动工作 |
+| M1-6 | 首启向导（简版）：监控盘、数据目录、快速/全盘模式、开机自启 | 三项选择后即可全自动工作（已交付，见 10.9） |
 | M1-7 | Inno Setup 安装器：per-machine、注册两个计划任务、授权 `ProgramData`、卸载清理 | 干净 Win10/11 虚拟机上装完重启即自动采集 |
 | M1-8 | CI 增加安装包产出 + SHA-256 | 打 tag 后 Release 里有 `Setup.exe` 与校验和 |
 
@@ -615,3 +615,154 @@ L3 上线一小时后，`#116` 在 1500 秒预算内只扫到 90.6 万文件（1
 - `scan_stage` 是真实表而非临时表，因此崩溃后残留的行需要 `prune` 清理；`prune` 会删掉所有非最新快照的暂存行（id 只增，旧行永远等不到合并）。
 - 目录行只影响路径解析，不参与字节统计：`total_allocated` 与 `used_delta` 的口径没有变化。
 - **`max_scan_seconds` 必须大于真实扫描时长**：partial 扫描在 L3 下不落库，超时等于这个窗口没有数据。换机器/换磁盘后第一件事是看 `run.log` 里单次扫描的 `elapsed`，把它乘以 1.5 设成预算。
+
+### 10.8 分发物补齐：托盘第一次被打包（2026-11-24）
+
+M1-4 的界面此前只存在于源码态（`python gui/tray.py`）。`CDriveSentinel.spec` 里只有一个 `EXE`，所以 `dist/CDriveSentinel/` 只有 `CDriveSentinel.exe`——**装完是一个看不见的后台进程加一个不存在的托盘图标**。这是"装完不能用"，优先级高于 M1-6/M1-7，所以先做。
+
+#### 两个入口，一份运行时
+
+| 程序 | 形态 | 理由 |
+|---|---|---|
+| `CDriveSentinel.exe` | `console=True` | `status` / `report` / `selftest` 必须能打印 |
+| `SentinelTray.exe` | `console=False` | 登录时弹黑框不可接受 |
+
+不合成一个 exe 的原因：`console=False` 会让 CLI 失去输出，`console=True` 会让托盘每次登录闪一个黑窗口。两个 Analysis 交给同一个 `COLLECT`，所以 PySide6 与 Python 运行时**只有一份**——实测目录 100 MiB，其中 PySide6 74 MiB，没有翻倍。
+
+采集进程那份 Analysis 仍然 `excludes=["PySide6"]`：一个提权守护进程不该加载 GUI 工具包。
+
+#### 落点规则对齐（防的是"界面和后台对不上"）
+
+旧 `find_db()` 的顺序是「exe 旁边有 `data/sentinel.db` 就用它」。装到 Program Files 后这个分支通常不命中，但**只要一次手动测试在程序目录留下 `data/`，界面就会一直读那份已经停止写入的历史库**，而守护进程写的是 ProgramData。表现是"屏幕上的数字不动了"，极难定位。
+
+`find_config()` 同理，且更危险：`dist/` 里本来就带 `config/`，于是界面读程序旁那份、采集进程读 ProgramData 那份，**两边用不同的阈值和保留策略**。
+
+现在两边共用同一套四步规则（`SENTINEL_HOME` → `portable.txt` → ProgramData → 项目目录），并逐种情形对拍过：
+
+| 情形 | 采集进程 `data_dir()` | 界面 `home()` | 一致 |
+|---|---|---|---|
+| 源码运行 | `D:/.../CDriveSentinel` | 同 | ✅ |
+| 源码 + `SENTINEL_HOME` | 该目录 | 同 | ✅ |
+| 安装版（frozen） | `%PROGRAMDATA%\CDriveSentinel` | 同 | ✅ |
+| 安装版 + `portable.txt` | 程序目录 | 同 | ✅ |
+
+界面不再"探测"程序旁的 `data/`：安装版只认约定位置。
+
+顺带修掉 `app_root()` 的冻结态错误。`Path(__file__).parent.parent` 在源码态正确，但打包后 `__file__` 指向 `_internal/`（甚至 `base_library.zip` 内部），会算错一层。现在 frozen 时用 `sys.executable` 的父目录。
+
+#### 顺带修掉两个"第一次打开就吓人"的缺陷
+
+打包后的托盘第一次渲染出来是这样（数据库还不存在，等价于全新安装）：
+
+| 缺陷 | 原因 | 现在 |
+|---|---|---|
+| 可用空间 **红色 `0 B` + "低于告警线"** | `load()` 在 `db.is_file()` 为假时直接 return，容量停在全零默认值 | 早退前先向 Windows 取真实容量（15.3 GB），红色标签消失 |
+| 右上角 **红色"读取失败"** | 库不存在被当成错误 | 新增 `pending` 状态：显示灰色"等待数据"，副标题说明"尚未开始采集 · 守护进程完成首次扫描后会自动显示数据" |
+| 今日净增 `0 B` | 同上 | 显示 `--` + "首次扫描完成后开始统计" |
+
+注意这是**第二条路径**：上一轮修的是"库存在但还没有心跳"，这次是"库根本不存在"。首启的两种半成品状态都要照顾。
+
+#### 窗口程序没有 stdout 会崩
+
+PyInstaller 的 `console=False` 启动时把 `sys.stdout` / `sys.stderr` 设成 `None`。任何 `print` —— 包括异常处理里的 —— 都会抛 `AttributeError: 'NoneType' object has no attribute 'write'`，于是一次本该被记录的崩溃变成进程静默消失。
+
+现在入口处先 `_ensure_streams()`：把两个流重定向到 `<数据目录>\logs\tray.log`（失败则 devnull），并安装 `sys.excepthook` 把未捕获异常写进同一份日志。双击启动的托盘从此有线索可查。
+
+#### 构建脚本不再递归删除
+
+`build.py` 原先 `shutil.rmtree(DIST)`。这有两个问题：不可恢复（`DIST` 一旦被改成别的路径就是灾难），以及约 100 个文件的递归删除会触发批量删除保护，导致脚本"第二次运行必失败"。
+
+改成 `_retire()`：把旧产物改名为 `CDriveSentinel.prev-<时间戳>` / `build.prev-<时间戳>`，构建结束打印路径，由人决定何时删。
+
+#### 实测
+
+```
+[3/5] verifying executables ...
+      CDriveSentinel.exe     ok
+      SentinelTray.exe       ok
+      folder size           100 MiB
+      PySide6 (one copy)    74 MiB
+
+冻结态落点：data_root = C:/ProgramData/CDriveSentinel   ✔
+空库首启  ：等待数据 / 15.3 GB 真实容量 / 今日净增 --   ✔
+真实库    ：+769 MB、Top 10、4 条告警、7 天趋势图        ✔
+命令行    ：status / runtime 正常                        ✔
+selftest  ：71/71
+```
+
+#### 边界
+
+- 安装器（M1-7）尚未存在，`%PROGRAMDATA%\CDriveSentinel` 目录与其 ACL 还没人创建。当前非提权运行 `SentinelTray.exe` 且从未安装时，会停在"等待数据"——正确但需要安装器收尾。
+- `install_task.ps1` 目前只注册采集进程的计划任务，**托盘的登录自启是 M1-7 的事**。
+- 托盘日志没有轮转：`logs/tray.log` 只在崩溃时增长，量级可忽略；若要长期运行再加大小上限。
+- 旧产物改名而非删除，`dist/` 会随构建次数堆积（每次约 100 MiB + `build/` 工作目录）。`build.py` 末尾会列出这些路径。
+
+### 10.9 M1-6 首启向导 + 扫描预算自标定已交付（2026-11-25）
+
+M1-6 的验收标准是"三项选择后即可全自动工作"。所以它不是一个多步向导，而是**一页三个问题**：监控哪里、占多少 C 盘空间、要不要开机自启。
+
+#### 分成三层，只有一层碰 GUI
+
+| 层 | 文件 | 为什么放这里 |
+|---|---|---|
+| 配置语义 | `p1_config.PROFILES` / `apply_profile()` / `save_config()` | 可被 selftest 覆盖，无 GUI 依赖 |
+| 命令 | `main.py setup`（交互 / `--profile --area --yes`） | 安装器将来可以静默调用 |
+| 界面 | `gui/setup_wizard.py` + `gui/setup_client.py` | 只做布局，配置由子进程写 |
+
+界面**不自己写 config.json**。它调 `CDriveSentinel.exe setup --profile X --area Y --yes`，和托盘"不 import src/"、"不写数据库"是同一条边界。否则档位表、原子写、scope 规则会在两个地方各有一份，然后慢慢不一致。
+
+#### 三个档位（预算与保留期绑定）
+
+| 档位 | 预算 | USN 明细 | 变化账本 | 归档 | 实测稳态占用 |
+|---|---|---|---|---|---|
+| 极简 | 320 MB | 1 天 | 3 天 | 1 天 | ~253 MB |
+| 标准 | 550 MB | 2 天 | 7 天 | 2 天 | ~447 MB |
+| 完整 | 800 MB | 3 天 | 14 天 | 3 天 | ~647 MB |
+
+预算是"上限"不是"目标"，所以每一档都留了余量——否则档位会常年贴着自己的上限、不停触发降级。`apply_profile()` 只改档位相关的 7 个键，`scope`、`exclude_paths`、告警线、调度间隔一律不动（用例 `M1-6 profile … keeps user settings` 钉住这条）。
+
+极简档顺带加了 `frn_path_map_enabled`（默认 `true`）。那张表是"这个文件以前叫什么"的历史，约 30 MB；关掉后路径解析少一个来源，两次扫描之间生灭的文件会更容易落到 `unresolved`——这是极简档明确的交换。
+
+#### 扫描预算：放在 daemon 里，不放在向导里
+
+`#116` 那次事故（1500 秒预算只扫到 88%，108 万行暂存全丢、清单停在上一份）的根因是**预算小于真实扫描时长**，而这个数字在扫描跑完之前谁都不知道。向导里做"标定扫描"意味着让用户等 25 分钟，不可接受。
+
+所以改成**每轮快照后自检**（`calibrate_scan_budget`）：
+
+- 取最近 5 次**完整**扫描的 `elapsed_seconds` 中位数；
+- 中位数 × 1.5 向上取整到 5 分钟；若大于当前预算就抬上去；
+- 只写 `max_scan_seconds` 一个键（读磁盘最新配置再写，手改的其他键不受影响）；
+- 只升不降——一次偶发变慢（杀毒软件、另一个备份在跑）不该缩小预算。
+
+`partial` 行被明确排除：超时的扫描什么都没测到，用它的耗时当依据会让预算越调越大。用例 `M1-6 partial scans do not inflate the budget` 就是钉这一条。
+
+#### 实测
+
+```
+M1-6 profile full/minimal/standard applies and keeps user settings   PASS
+M1-6 an unknown profile is rejected                                 PASS
+M1-6 config save is atomic and drops runtime keys                   PASS
+M1-6 budget is raised above the median real scan                    PASS  (2050s 中位 → 3300s)
+M1-6 budget calibration is idempotent                               PASS
+M1-6 partial scans do not inflate the budget                        PASS
+selftest: 79/79
+
+端到端（源码态）：is_configured False → run_setup("full","full") → True
+                  config: profile=full budget=800 usn=3 ledger=14 scope=[]
+                  run_setup("nope") → False，错误来自 argparse 的 choices
+端到端（打包态）：CDriveSentinel.exe setup --profile minimal --area full --yes
+                  → 写入探针目录，setup_complete=True
+```
+
+#### 界面上踩过的坑（记录下来免得再踩）
+
+`QRadioButton::indicator` 用 QSS 自绘时，**只要同时给 `QCheckBox::indicator` 写样式**，Qt 会把两种按钮的指示器都交给统一自绘路径，radio 于是被画成**圆角方框**——看上去和复选框一样，用户分不清。试过 `border-radius` 写进每个状态、写过 `10px`/`12px` 都没有用。
+
+最后的解法是给向导单独 `setStyle(QStyleFactory.create("Fusion"))`，让 Fusion 自己画圆，QSS 只负责颜色和间距。原生 Windows 风格在套了 QSS 之后反而把指示器画成几乎不可见的白点。
+
+#### 边界
+
+- **开机自启仍依赖 `install_task.ps1`**。向导勾选后会 `ShellExecuteW runas` 提权运行它；用户拒绝 UAC 时向导如实提示"后台任务未注册，之后可手动运行"。Inno Setup（M1-7）落地后这一步会变成安装器的一部分，向导不再需要提权。
+- 向导只写配置，**不做首次扫描**（只写一条 `request_scan` 请求）。若守护进程没在跑，这次请求会在它下次启动时被消费——`runtime.last_scan_request` 是持久化的。
+- 源码态若 `SENTINEL_HOME` 指向被监控的卷，`data_dir()` 会把它自动重定位到另一块盘（实测会出现在 `C:/CDriveSentinelData`）。这是 M1-1 的既有行为，不是向导引入的，但在"数据放哪"这件事上确实容易让人困惑，值得在 M3 设置页里显式给出实际落点。
+- 已经配好的机器不该被向导打断：`config.json` 里 `setup_complete=true` 即为已配置。本机现有配置被标记为 `setup_profile: "custom"`（手工调过，不属于任何预设），向导不会自动弹出，需要时可用 `--wizard` 手动打开。

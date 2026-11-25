@@ -141,6 +141,7 @@ DEFAULT_CONFIG = {
     # 159 MB to fix 532 of ~7,000 paths. Off by default; `usn-index` still
     # works and is kept if you turn this on.
     "mft_index_enabled": False,
+    "frn_path_map_enabled": True,
     "usn_reason_mask": None,
     "daily_report_enabled": True,
     "daily_report_hour": 8,
@@ -151,6 +152,107 @@ DEFAULT_CONFIG = {
         "note": "P1 diffs by NTFS file ID; WizTree CSV has no FRN column, so P1 uses the built-in scanner. WizTree is used by P0 and planned for P2."
     }
 }
+
+
+# --------------------------------------------------------------- profiles
+# Presets the first-run wizard offers. The numbers come from measurements on a
+# 1.03M-file C: (see docs/P5_DESKTOP_PRODUCT_PLAN.md 10.5-10.8), with headroom so
+# a profile does not sit permanently at its own budget and constantly degrade:
+#
+#   minimal  ~253 MB of data   -> budget 320
+#   standard ~447 MB of data   -> budget 550   (this is the steady-state config)
+#   full     ~647 MB of data   -> budget 800
+#
+# `data_size_alert_mb` follows the budget on purpose: the "own footprint" alert
+# should fire when the profile's own ceiling is crossed, not at a stale number.
+PROFILES = {
+    "minimal": {
+        "label": "极简",
+        "data_budget_mb": 320,
+        "data_size_alert_mb": 320,
+        "usn_retention_days": 1,
+        "retention_days": 3,
+        "archive_retention_days": 1,
+        "frn_path_map_enabled": False,
+        "mft_index_enabled": False,
+        "note": "只保留最近 1 天的实时事件明细；C 盘余量紧张时选这个",
+    },
+    "standard": {
+        "label": "标准",
+        "data_budget_mb": 550,
+        "data_size_alert_mb": 550,
+        "usn_retention_days": 2,
+        "retention_days": 7,
+        "archive_retention_days": 2,
+        "frn_path_map_enabled": True,
+        "mft_index_enabled": False,
+        "note": "保留 2 天实时事件 + 7 天变化账本，界面上的趋势图基于它",
+    },
+    "full": {
+        "label": "完整",
+        "data_budget_mb": 800,
+        "data_size_alert_mb": 800,
+        "usn_retention_days": 3,
+        "retention_days": 14,
+        "archive_retention_days": 3,
+        "frn_path_map_enabled": True,
+        "mft_index_enabled": False,
+        "note": "保留 3 天实时事件 + 14 天账本，适合想回看较长时间的人",
+    },
+}
+DEFAULT_PROFILE = "standard"
+PROFILE_KEYS = ("data_budget_mb", "data_size_alert_mb", "usn_retention_days",
+                "retention_days", "archive_retention_days",
+                "frn_path_map_enabled", "mft_index_enabled")
+
+
+def apply_profile(cfg: dict, name: str) -> dict:
+    """Return a copy of *cfg* with one footprint profile applied.
+
+    Only the keys in ``PROFILE_KEYS`` are touched; everything the user set by
+    hand (scope, exclusions, thresholds, schedule) survives a profile change.
+    Lowering the profile does not delete anything immediately -- retention runs
+    on the next prune, which is what the wizard tells the user.
+    """
+    profile = PROFILES.get(name)
+    if not profile:
+        raise ValueError("unknown profile %r (have: %s)"
+                         % (name, ", ".join(sorted(PROFILES))))
+    out = dict(cfg)
+    for key in PROFILE_KEYS:
+        if key in profile:
+            out[key] = profile[key]
+    out["_profile"] = name
+    return out
+
+
+def public_config(cfg: dict) -> dict:
+    """Drop runtime-only bookkeeping (``_config_path`` etc.) before writing.
+
+    ``_comment`` is kept: it is the only documentation a user editing
+    config.json by hand will see.
+    """
+    out = {}
+    for key, value in cfg.items():
+        if key.startswith("_") and key != "_comment":
+            continue
+        out[key] = value
+    return out
+
+
+def save_config(cfg: dict, path=None) -> Path:
+    """Write config atomically.
+
+    The daemon may be reading this file at the same moment; a half-written
+    config.json is worse than an old one, so write a temp file and replace.
+    """
+    p = Path(path) if path else CONFIG_PATH
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(public_config(cfg), indent=2, ensure_ascii=False) + "\n",
+                   encoding="utf-8")
+    os.replace(tmp, p)
+    return p
 
 
 def volume_root(volume: str) -> str:

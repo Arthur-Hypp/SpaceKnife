@@ -454,13 +454,19 @@ def merge_inventory(conn, cfg, paths, curr_id, log=lambda msg: None):
                              "RENAME", "OVERWRITE")}
     attributed = 0
     mapped = []
+    # frn_path_map is the "what was this file called before it was deleted"
+    # history. It is a pure convenience layer (~30 MB with its index), so the
+    # minimal footprint profile turns it off; path resolution then falls back to
+    # the inventory and to parent-FRN lookups, which is slightly less complete
+    # for files that were created and destroyed inside one window.
+    keep_history = bool(cfg.get("frn_path_map_enabled", True))
 
     def emit(ev, mapping=None):
         nonlocal attributed
         sink.add(ev)
         counts[ev["op"]] = counts.get(ev["op"], 0) + 1
         attributed += ev["delta_bytes"]
-        if mapping:
+        if mapping and keep_history:
             mapped.extend(mapping)
             if len(mapped) >= BATCH:
                 _apply_map(conn, mapped, curr["ts_local"])

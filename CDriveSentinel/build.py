@@ -24,13 +24,39 @@ to the exe would make the tray read a different file than the daemon.
 """
 from __future__ import annotations
 
+import json
 import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 DIST = HERE / "dist" / "CDriveSentinel"
+
+
+def _retire(path: Path) -> Path | None:
+    """Move a previous artifact tree aside instead of deleting it.
+
+    Two reasons not to ``rmtree`` here:
+      * it is unrecoverable -- a mistyped DIST one day removes a folder that is
+        not a build artifact at all;
+      * a recursive delete of ~100 files trips bulk-delete guards, which turned
+        this script into "always fails on the second run".
+    Renaming is instant, keeps the build repeatable, and leaves the decision
+    about reclaiming space to whoever runs it.
+    """
+    if not path.exists():
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    target = path.with_name("%s.prev-%s" % (path.name, stamp))
+    try:
+        path.rename(target)
+    except OSError as exc:
+        print("      WARNING could not retire %s: %s" % (path, exc))
+        return None
+    print("      moved %-22s -> %s" % (path.name, target.name))
+    return target
 
 
 def main() -> int:
@@ -41,13 +67,8 @@ def main() -> int:
         print("    python -m pip install pyinstaller")
         return 2
 
-    print("[1/5] cleaning previous build ...")
-    for name in ("build",):
-        p = HERE / name
-        if p.exists():
-            shutil.rmtree(p, ignore_errors=True)
-    if DIST.exists():
-        shutil.rmtree(DIST, ignore_errors=True)
+    print("[1/5] setting previous artifacts aside ...")
+    retired = [p for p in (_retire(HERE / "build"), _retire(DIST)) if p]
 
     print("[2/5] running PyInstaller (onedir, 2 executables) ...")
     cmd = [sys.executable, "-m", "PyInstaller",
@@ -83,11 +104,25 @@ def main() -> int:
     print("[4/5] shipping config template and docs ...")
     # Ship a template config as config/config.default.json. The app itself
     # creates config/config.json on first run; this file documents the options.
+    # Machine-specific state (the setup flags, the scope this developer chose)
+    # is stripped: a template that says "setup_complete" would make a fresh
+    # install skip its own first-run wizard.
     cfg_src = HERE / "config" / "config.json"
     cfg_dir = DIST / "config"
     cfg_dir.mkdir(parents=True, exist_ok=True)
     if cfg_src.is_file():
-        shutil.copy2(cfg_src, cfg_dir / "config.default.json")
+        try:
+            template = json.loads(cfg_src.read_text(encoding="utf-8"))
+            if isinstance(template, dict):
+                for key in ("setup_complete", "setup_profile", "setup_at"):
+                    template.pop(key, None)
+                (cfg_dir / "config.default.json").write_text(
+                    json.dumps(template, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
+            else:
+                shutil.copy2(cfg_src, cfg_dir / "config.default.json")
+        except (OSError, ValueError):
+            shutil.copy2(cfg_src, cfg_dir / "config.default.json")
     for doc in ("README.md", "LICENSE"):
         src = HERE.parent / doc
         if src.is_file():
@@ -131,6 +166,11 @@ def main() -> int:
         encoding="utf-8")
 
     print("\nBuild complete: %s" % DIST)
+    if retired:
+        print("Previous artifacts were renamed, not deleted:")
+        for p in retired:
+            print("  %s" % p)
+        print("Delete them yourself once the new build looks right.")
     return 0
 
 
