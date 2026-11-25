@@ -249,6 +249,12 @@ CDriveSentinel_backup_*/
 *.exe
 
 # PyInstaller build artifacts (regenerate with build.py)
+#
+# 例外：发行安装包 `CDriveSentinel/dist/CDriveSentinel-<版本>-Setup.exe` 是**故意入库**的
+# （2026-11-25，0.3.0 起），这样没有 Python / PyInstaller / Inno Setup 的机器克隆下来
+# 就能双击安装。它用 `git add -f` 显式加入，下面的规则对它依然生效——新的版本号要入库
+# 就得再 `git add -f` 一次，避免 `git add -A` 顺手把 onedir 文件夹（102 MiB / 213 个文件）
+# 和 40 MB 的 ZIP 也塞进历史。
 CDriveSentinel/build/
 CDriveSentinel/dist/
 # build.py retires old artifacts as <name>.prev-<timestamp> instead of deleting
