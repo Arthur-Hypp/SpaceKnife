@@ -20,9 +20,10 @@
 ;   history is not something to remove because someone re-ran Setup.
 
 #define AppName        "CDriveSentinel"
-#define AppVer         "0.3.1"
+#define AppVer         "0.3.2"
 #define AppPublisher   "SpaceKnife"
 #define AppExe         "CDriveSentinel.exe"
+#define DaemonExe      "CDriveSentinelDaemon.exe"
 #define TrayExe        "SentinelTray.exe"
 #define SrcDir         "dist\CDriveSentinel"
 
@@ -56,6 +57,7 @@ Name: "trayautostart"; Description: "登录时自动启动托盘图标"; GroupDe
 
 [Files]
 Source: "{#SrcDir}\{#AppExe}";      DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SrcDir}\{#DaemonExe}";   DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SrcDir}\{#TrayExe}";     DestDir: "{app}"; Flags: ignoreversion
 Source: "{#SrcDir}\_internal\*";    DestDir: "{app}\_internal"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#SrcDir}\config\*";       DestDir: "{app}\config"; Flags: ignoreversion skipifsourcedoesntexist

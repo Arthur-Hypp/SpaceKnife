@@ -27,11 +27,25 @@ if (-not $principalCheck.IsInRole([Security.Principal.WindowsBuiltInRole]::Admin
 }
 
 $exe = Join-Path $root "CDriveSentinel.exe"
+$daemonExe = Join-Path $root "CDriveSentinelDaemon.exe"
 if (Test-Path -LiteralPath $exe) {
     # Packaged layout: the folder containing the exe is also where config/ and
-    # data/ live (see p1_config.app_dir()). Hide the console window.
-    $action = New-ScheduledTaskAction -Execute $exe -Argument "daemon" -WorkingDirectory $root
-    $launchDesc = "EXE   : $exe"
+    # data/ live (see p1_config.app_dir()).
+    #
+    # Prefer the windowed daemon exe. The console exe is fine as a CLI, but a
+    # console program started by Task Scheduler gets a console window, and
+    # closing that window sends CTRL_CLOSE_EVENT: the collector dies with
+    # 0xC000013A (2026-11-25 17:09:07) and the task quietly returns to Ready
+    # without anyone noticing that nothing is scanning any more.
+    if (Test-Path -LiteralPath $daemonExe) {
+        $action = New-ScheduledTaskAction -Execute $daemonExe -WorkingDirectory $root
+        $launchDesc = "EXE   : $daemonExe (windowed -- no console window)"
+    } else {
+        $action = New-ScheduledTaskAction -Execute $exe -Argument "daemon" -WorkingDirectory $root
+        $launchDesc = "EXE   : $exe daemon (CONSOLE -- do not close its window)"
+        Write-Host "WARNING: CDriveSentinelDaemon.exe is missing; falling back to the" -ForegroundColor Yellow
+        Write-Host "         console exe. Closing its console window stops the collector." -ForegroundColor Yellow
+    }
     # Where the data actually lives is decided at run time: an install-time
     # pointer (home.txt) or ProgramData -- never "next to the exe" any more.
     $outputDesc = "the folder that CDriveSentinel.exe paths reports"

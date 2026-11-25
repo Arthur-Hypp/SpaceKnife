@@ -100,7 +100,7 @@ function Grant-UsersModify([string]$Path) {
 }
 
 function Stop-Running {
-    foreach ($name in @("SentinelTray", "CDriveSentinel")) {
+    foreach ($name in @("SentinelTray", "CDriveSentinelDaemon", "CDriveSentinel")) {
         Get-Process -Name $name -ErrorAction SilentlyContinue |
             Where-Object { $_.Path -and $_.Path.StartsWith($InstallDir, "OrdinalIgnoreCase") } |
             Stop-Process -Force -ErrorAction SilentlyContinue
@@ -160,7 +160,7 @@ if (-not (Test-Path -LiteralPath $Source)) {
     Write-Host "       Run 'python build.py' first."
     exit 2
 }
-foreach ($exe in @("CDriveSentinel.exe", "SentinelTray.exe")) {
+foreach ($exe in @("CDriveSentinel.exe", "CDriveSentinelDaemon.exe", "SentinelTray.exe")) {
     if (-not (Test-Path -LiteralPath (Join-Path $Source $exe))) {
         Write-Host ("ERROR: {0} is missing from the build output." -f $exe) -ForegroundColor Red
         exit 2

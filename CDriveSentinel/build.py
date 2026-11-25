@@ -12,10 +12,17 @@ Steps:
   5. Ship a config template + README + LICENSE next to the exe.
 
 Result: dist/CDriveSentinel/ is the folder to hand out / zip up. It contains
-two programs sharing one _internal/:
+three programs sharing one _internal/:
 
-    CDriveSentinel.exe   console -- init-db / snapshot / daemon / status / report
-    SentinelTray.exe     windowed -- tray icon, dashboard, 立即扫描 / 暂停
+    CDriveSentinel.exe        console -- init-db / snapshot / status / report
+    CDriveSentinelDaemon.exe  windowed -- the background collector (no console)
+    SentinelTray.exe          windowed -- tray icon, dashboard, 立即扫描 / 暂停
+
+The collector exists twice on purpose: the console build is the CLI, the windowed
+build is what the scheduled task runs. A console exe started by Task Scheduler
+gets a console window, and closing that window terminates the process (0xC000013A)
+-- a background monitor that stops when someone tidies up the taskbar is not a
+background monitor.
 
 Neither ships a config/config.json: on first run the program writes one under
 its data folder (%PROGRAMDATA%\\CDriveSentinel when installed, the folder itself
@@ -70,7 +77,7 @@ def main() -> int:
     print("[1/5] setting previous artifacts aside ...")
     retired = [p for p in (_retire(HERE / "build"), _retire(DIST)) if p]
 
-    print("[2/5] running PyInstaller (onedir, 2 executables) ...")
+    print("[2/5] running PyInstaller (onedir, 3 executables) ...")
     cmd = [sys.executable, "-m", "PyInstaller",
            str(HERE / "CDriveSentinel.spec"), "--noconfirm",
            "--distpath", str(HERE / "dist"),
@@ -81,13 +88,13 @@ def main() -> int:
         return rc
 
     print("[3/5] verifying executables ...")
-    # The spec builds two entry points into one folder. If only one lands, the
-    # product is "a background process with no way to look at it", which is
-    # exactly the state this step exists to catch before it reaches a zip.
+    # The spec builds three entry points into one folder. If the windowed
+    # daemon is missing, the scheduled task has to fall back to the console exe,
+    # which brings back the "close the window and the collector dies" failure.
     missing = []
-    for name in ("CDriveSentinel.exe", "SentinelTray.exe"):
+    for name in ("CDriveSentinel.exe", "CDriveSentinelDaemon.exe", "SentinelTray.exe"):
         exists = (DIST / name).is_file()
-        print("      %-22s %s" % (name, "ok" if exists else "MISSING"))
+        print("      %-26s %s" % (name, "ok" if exists else "MISSING"))
         if not exists:
             missing.append(name)
     if missing:
@@ -149,16 +156,20 @@ def main() -> int:
     (DIST / "使用说明.txt").write_text(
         "CDriveSentinel - 只读 C 盘空间变化监测工具\n"
         "============================================\n\n"
-        "这个文件夹里有两个程序，共用一个 _internal\\ 运行时：\n\n"
-        "  SentinelTray.exe      双击即可 —— 托盘图标 + 面板（看数据、立即扫描、暂停）\n"
-        "  CDriveSentinel.exe    命令行 —— 采集进程与维护命令（见下）\n\n"
+        "这个文件夹里有三个程序，共用一个 _internal\\ 运行时：\n\n"
+        "  SentinelTray.exe          双击即可 —— 托盘图标 + 面板（看数据、立即扫描、暂停）\n"
+        "  CDriveSentinelDaemon.exe  后台采集进程（无窗口，由开机任务启动）\n"
+        "  CDriveSentinel.exe        命令行 —— 维护与查询命令（见下）\n\n"
         "日常使用只需要 SentinelTray.exe。面板里的「立即扫描」「暂停」会通知采集进程，\n"
         "界面本身不需要管理员权限，也从不写数据库。\n\n"
+        "后台采集请用 CDriveSentinelDaemon.exe：它是无窗口版本，任务管理器里也没有\n"
+        "命令行窗口可关。不要用 CDriveSentinel.exe daemon 长期跑 —— 那会带一个控制台\n"
+        "窗口，关掉窗口等于终止采集（退出码 0xC000013A）。\n\n"
         "命令行（在本文件夹内打开 cmd / PowerShell）：\n"
         "  CDriveSentinel.exe status\n"
         "  CDriveSentinel.exe init-db\n"
         "  CDriveSentinel.exe snapshot\n"
-        "  CDriveSentinel.exe daemon\n"
+        "  CDriveSentinel.exe daemon        （前台调试用，正式请用 Daemon.exe）\n"
         "  CDriveSentinel.exe scan-now      （请求守护进程立刻扫一次）\n"
         "  CDriveSentinel.exe pause / resume\n"
         "  CDriveSentinel.exe selftest\n"

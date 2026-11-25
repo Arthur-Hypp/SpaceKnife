@@ -303,6 +303,8 @@ CREATE INDEX idx_event_frn    ON change_event(frn);
 {"ts_local":"2026-11-16 02:13:47","window":"2026-11-16 02:00~02:15","volume":"C:","frn":"0x0000000000012ab3","path":"C:\\Windows\\SoftwareDistribution\\Download\\8f3a.cab","top_dir":"C:\\Windows\\SoftwareDistribution","op":"CREATE","reason_mask":258,"logical_size":2147483648,"allocated_size":2147486720,"delta_bytes":2147486720,"process":"svchost.exe","pid":3212,"evidence":"usn+snapshot+sysmon","confidence":"high","note":"Windows 更新缓存"}
 ```
 
+**后台采集进程必须是无窗口的**（2026-11-25 事故）。计划任务启动的是**控制台**程序时，Windows 会给它一个真实的控制台窗口（标题就是 exe 全路径）。关闭那个窗口 = `CTRL_CLOSE_EVENT`，默认处理直接终止进程：退出码 `0xC000013A`（`STATUS_CONTROL_C_EXIT`），没有 traceback、`run.log` 里也没有 `FATAL`，任务状态悄悄回到 Ready —— 采集从此不再运行，而界面上看不出来。当天就是这么丢的（17:09:07，`LastTaskResult = 3221225786`）。现行方案：**同一个采集器编译两份**，`CDriveSentinel.exe`（console，供 status/report/selftest 打印）与 `CDriveSentinelDaemon.exe`（`console=False`，任务里跑的就是它，没有任何窗口可关）；入口 `src/daemon_win.py` 只把 argv 固定成 `daemon`。注意 `New-ScheduledTaskSettingsSet -Hidden` 只隐藏**任务**，不隐藏窗口，别指望它。
+
 `reason_mask` 示例 `258 = 0x102 = FILE_CREATE(0x100) | DATA_EXTEND(0x2)`。
 
 **人读日报**（`reports/daily/YYYY-MM-DD.html` 与 CLI 输出）：

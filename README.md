@@ -34,12 +34,15 @@ C 盘空间变化实时监测与归因工具集。回答一个问题：**C 盘�
 **只想用、不想装编译环境**：仓库里直接带了发行安装包，克隆后双击即可（Windows，无需 Python）：
 
 ```
-CDriveSentinel\dist\CDriveSentinel-0.3.1-Setup.exe
+CDriveSentinel\dist\CDriveSentinel-0.3.2-Setup.exe
 ```
 
 安装版把程序放到 `%PROGRAMDATA%\CDriveSentinel` 的数据目录旁，可选注册登录自启（要一次管理员授权）。
 升级时直接装新版本号即可覆盖，数据不会动。仓库里只保留**最新**一个安装包（旧的删掉，历史的在 git 里）；
 绿色版（onedir ZIP）在 [Releases](https://github.com/Arthur-Hypp/SpaceKnife/releases) 或本地 `python build.py`。
+
+后台采集用的是 **`CDriveSentinelDaemon.exe`**（无窗口版本）：任务管理器里没有命令行窗口，
+也就不存在"顺手关掉窗口把采集杀掉"这回事。`CDriveSentinel.exe daemon` 只用于前台调试。
 
 **从源码跑**：在 `CDriveSentinel/` 目录下执行：
 
