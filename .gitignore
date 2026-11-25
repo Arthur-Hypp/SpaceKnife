@@ -255,6 +255,9 @@ CDriveSentinel_backup_*/
 # 就能双击安装。它用 `git add -f` 显式加入，下面的规则对它依然生效——新的版本号要入库
 # 就得再 `git add -f` 一次，避免 `git add -A` 顺手把 onedir 文件夹（102 MiB / 213 个文件）
 # 和 40 MB 的 ZIP 也塞进历史。
+#
+# 仓库里只放**最新那一个**安装包：出新版时 `git rm --cached` 掉旧的（历史里仍可找回），
+# 否则每版 28 MB 会一直累加在 HEAD 上。
 CDriveSentinel/build/
 CDriveSentinel/dist/
 # build.py retires old artifacts as <name>.prev-<timestamp> instead of deleting

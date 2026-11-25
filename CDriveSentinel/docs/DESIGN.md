@@ -297,6 +297,8 @@ CREATE INDEX idx_event_frn    ON change_event(frn);
 
 `data/logs/YYYY-MM-DD.jsonl`，一行一事件，UTF-8，追加写，按日轮转，保留 90 天（清理操作只针对本项目自己在 D 盘的日志）。
 
+**采集器运行日志 `data/run.log` 永远不能被 stdout 卡死**（2026-11-25 事故）。计划任务启动的进程，stdout 是一条没人读的管道：管道写满时 `print()` **不抛异常，而是永久阻塞**，`except (OSError, ValueError)` 抓不到。当天守护进程就死在 `log()` 的 `print()` 里（py-spy：`log <- UsnJournal.open <- run_usn_poll`），连带 `run.log` 一行没写（文件写当时排在 print 之后）。现行实现：`log()` **先写文件、再尽力回显**；回显走一条有界队列（2000 行）+ 一条 daemon 泵线程，用 `os.write(1, ...)` 直接写 fd（不碰 `sys.stdout` 的 buffered 锁，避免进程退出时 `_enter_buffered_busy` 致命错误）；队列满就丢行，采集主循环永远不阻塞。
+
 ```json
 {"ts_local":"2026-11-16 02:13:47","window":"2026-11-16 02:00~02:15","volume":"C:","frn":"0x0000000000012ab3","path":"C:\\Windows\\SoftwareDistribution\\Download\\8f3a.cab","top_dir":"C:\\Windows\\SoftwareDistribution","op":"CREATE","reason_mask":258,"logical_size":2147483648,"allocated_size":2147486720,"delta_bytes":2147486720,"process":"svchost.exe","pid":3212,"evidence":"usn+snapshot+sysmon","confidence":"high","note":"Windows 更新缓存"}
 ```

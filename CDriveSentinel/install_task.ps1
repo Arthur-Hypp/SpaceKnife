@@ -97,8 +97,23 @@ Write-Host "  Start  : at logon, highest run level"
 Write-Host "The daemon only READS C:; all output goes to $outputDesc"
 
 if ($Start) {
+    # A task left in the Running state -- a wedged instance, or one whose
+    # process is already gone -- makes every later start a silent no-op, because
+    # MultipleInstances is IgnoreNew. Clear it first so "Started now" is true.
+    $existing = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($existing -and $existing.State -ne "Ready") {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 800
+        Write-Host "Cleared a stale '$($existing.State)' instance first."
+    }
     Start-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    Write-Host "Started now."
+    Start-Sleep -Milliseconds 1500
+    $after = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if ($after -and $after.State -eq "Running") {
+        Write-Host "Started now (state=Running)."
+    } else {
+        Write-Host "WARNING: task state is '$($after.State)' after start - see run.log at $outputDesc" -ForegroundColor Yellow
+    }
 } else {
     Write-Host "To start it now: Start-ScheduledTask -TaskName $taskName"
 }

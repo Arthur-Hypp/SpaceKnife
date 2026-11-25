@@ -30,8 +30,10 @@ import gzip
 import json
 import math
 import os
+import queue
 import shutil
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -51,16 +53,76 @@ from p0_baseline import is_admin, volume_usage
 
 LOG_FH = None
 
+# Nothing in the collector may block on stdout. When the daemon is started by
+# the scheduled task its stdout is a pipe nobody drains: a full pipe does not
+# raise, it blocks the writer forever. On 2026-11-25 that wedged the daemon
+# inside print() for hours (py-spy: log <- UsnJournal.open <- run_usn_poll) and
+# the run.log behind it stayed 0 bytes, because the file write came after the
+# print. So the file gets every line first, and stdout became best effort: one
+# pump thread owns it, and the queue drops lines when nobody is draining.
+_STDOUT_MAX_LINES = 2000
+_stdout_queue = None
+_stdout_thread = None
+_stdout_lock = threading.Lock()
+
+
+def _stdout_pump():
+    # Raw os.write on purpose: it blocks (like any write to a starved pipe) but
+    # it never touches the buffered writer's lock, so a pump stuck at process
+    # exit cannot turn into "_enter_buffered_busy at interpreter shutdown".
+    try:
+        fd = sys.stdout.fileno()
+    except (AttributeError, OSError, ValueError):
+        return
+    while True:
+        line = _stdout_queue.get()
+        if line is None:
+            return
+        try:
+            os.write(fd, (line + "\n").encode("utf-8", "replace"))
+        except (OSError, ValueError):
+            return  # console is gone; drop the rest, keep the collector alive
+
+
+def _stdout_emit(text):
+    global _stdout_queue, _stdout_thread
+    if getattr(sys, "stdout", None) is None:
+        return
+    with _stdout_lock:
+        if _stdout_thread is None:
+            _stdout_queue = queue.Queue(maxsize=_STDOUT_MAX_LINES)
+            _stdout_thread = threading.Thread(
+                target=_stdout_pump, name="stdout-pump", daemon=True)
+            _stdout_thread.start()
+        q = _stdout_queue
+    try:
+        q.put_nowait(text)
+    except queue.Full:
+        pass  # nobody is reading the console; losing the echo is acceptable
+
+
+def flush_stdout(timeout=2.0):
+    """Give the pump a moment to drain.
+
+    Bounded on purpose: a console that stopped reading must never keep the
+    process alive, so this degrades to "some tail lines were lost".
+    """
+    t = _stdout_thread
+    q = _stdout_queue
+    if t is None or q is None:
+        return
+    try:
+        q.put(None, timeout=0.2)
+    except queue.Full:
+        return
+    try:
+        t.join(timeout)
+    except RuntimeError:
+        pass
+
 
 def log(msg=""):
     text = str(msg)
-    # A detached console (scheduled task, or a closed pipe) raises OSError on
-    # print. Losing the log line is acceptable; dying because stdout vanished
-    # is not -- that is how the collector silently stopped on 2026-11-24.
-    try:
-        print(text, flush=True)
-    except (OSError, ValueError):
-        pass
     if LOG_FH:
         try:
             LOG_FH.write("%s  %s\n" % (
@@ -68,6 +130,7 @@ def log(msg=""):
             LOG_FH.flush()
         except OSError:
             pass
+    _stdout_emit(text)
 
 
 def open_runlog(paths):
@@ -2457,7 +2520,9 @@ def main(argv=None):
     if cmd not in handlers:
         parser.error("unknown command %r; choose from %s" %
                      (cmd, ", ".join(handlers)))
-    return handlers[cmd](cfg, paths, args)
+    rc = handlers[cmd](cfg, paths, args)
+    flush_stdout(1.0)
+    return rc
 
 
 def _fatal_to_runlog(exc):
