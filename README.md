@@ -34,7 +34,7 @@ C 盘空间变化实时监测与归因工具集。回答一个问题：**C 盘�
 **只想用、不想装编译环境**：仓库里直接带了发行安装包，克隆后双击即可（Windows，无需 Python）：
 
 ```
-CDriveSentinel\dist\CDriveSentinel-0.3.2-Setup.exe
+CDriveSentinel\dist\CDriveSentinel-0.3.3-Setup.exe
 ```
 
 安装版把程序放到 `%PROGRAMDATA%\CDriveSentinel` 的数据目录旁，可选注册登录自启（要一次管理员授权）。

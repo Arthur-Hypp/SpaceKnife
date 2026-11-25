@@ -20,7 +20,7 @@
 ;   history is not something to remove because someone re-ran Setup.
 
 #define AppName        "CDriveSentinel"
-#define AppVer         "0.3.2"
+#define AppVer         "0.3.3"
 #define AppPublisher   "SpaceKnife"
 #define AppExe         "CDriveSentinel.exe"
 #define DaemonExe      "CDriveSentinelDaemon.exe"
@@ -46,6 +46,12 @@ PrivilegesRequired=admin
 UninstallDisplayName={#AppName}
 UninstallDisplayIcon={app}\{#TrayExe}
 AllowNoIcons=yes
+; The collector is windowed (no message pump), so Restart Manager can never ask
+; it to close politely -- Inno would abort with "Setup was unable to
+; automatically close all applications" on every upgrade (seen 2026-11-25 17:41).
+; StopCollector() in [Code] stops the task and the processes instead.
+CloseApplications=no
+RestartApplications=no
 
 [Languages]
 Name: "en"; MessagesFile: "compiler:Default.isl"
@@ -188,11 +194,34 @@ begin
   end;
 end;
 
+procedure StopCollector();
+var
+  Rc: Integer;
+begin
+  { The collector runs windowed and has no message pump, so Setup cannot close
+    it through the Restart Manager. Stop the task and the processes ourselves,
+    exactly like install.ps1 -Uninstall/-Install does. }
+  Exec('powershell.exe',
+       '-ExecutionPolicy Bypass -NoProfile -WindowStyle Hidden -Command "'
+       + 'Stop-ScheduledTask -TaskName CDriveSentinel -ErrorAction SilentlyContinue; '
+       + 'Start-Sleep -Milliseconds 400; '
+       + 'Get-Process SentinelTray,CDriveSentinelDaemon,CDriveSentinel '
+       + '-ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; '
+       + 'Start-Sleep -Milliseconds 600"',
+       '', SW_HIDE, ewWaitUntilTerminated, Rc);
+end;
+
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   DataDir, PtrDir, PtrFile: String;
   Rc: Integer;
 begin
+  if CurStep = ssInstall then
+  begin
+    StopCollector();
+    Exit;
+  end;
+
   if CurStep <> ssPostInstall then
     Exit;
 

@@ -304,6 +304,7 @@ CREATE INDEX idx_event_frn    ON change_event(frn);
 ```
 
 **后台采集进程必须是无窗口的**（2026-11-25 事故）。计划任务启动的是**控制台**程序时，Windows 会给它一个真实的控制台窗口（标题就是 exe 全路径）。关闭那个窗口 = `CTRL_CLOSE_EVENT`，默认处理直接终止进程：退出码 `0xC000013A`（`STATUS_CONTROL_C_EXIT`），没有 traceback、`run.log` 里也没有 `FATAL`，任务状态悄悄回到 Ready —— 采集从此不再运行，而界面上看不出来。当天就是这么丢的（17:09:07，`LastTaskResult = 3221225786`）。现行方案：**同一个采集器编译两份**，`CDriveSentinel.exe`（console，供 status/report/selftest 打印）与 `CDriveSentinelDaemon.exe`（`console=False`，任务里跑的就是它，没有任何窗口可关）；入口 `src/daemon_win.py` 只把 argv 固定成 `daemon`。注意 `New-ScheduledTaskSettingsSet -Hidden` 只隐藏**任务**，不隐藏窗口，别指望它。
+无窗口还有个副作用要记住：安装器升级前用 Restart Manager 请占用文件的进程自行关闭，而**没有消息泵的进程收不到这个请求**，Setup 会弹 "unable to automatically close all applications"。所以安装器改成 `CloseApplications=no`，复制文件前用 `StopCollector()`（停任务 + 结束进程）自己解决，和 `install.ps1` 的 `Stop-Running` 同一套动作。
 
 `reason_mask` 示例 `258 = 0x102 = FILE_CREATE(0x100) | DATA_EXTEND(0x2)`。
 
