@@ -204,6 +204,11 @@ DEFAULT_CONFIG = {
     "daily_report_hour": 8,
     "daily_report_top": 20,
     "daily_popup_enabled": True,
+    # Rewrite today's report (midnight -> now) after every snapshot so the
+    # dashboard's "open report" button opens today, not yesterday. The whole-day
+    # edition still overwrites the same file at daily_report_hour the next day;
+    # the CLI popup keeps opening yesterday.
+    "rolling_report_enabled": True,
     "wiztree": {
         "exe": "tools/WizTree64.exe",
         "note": "P1 diffs by NTFS file ID; WizTree CSV has no FRN column, so P1 uses the built-in scanner. WizTree is used by P0 and planned for P2."

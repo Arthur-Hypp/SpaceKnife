@@ -470,6 +470,7 @@ powershell -ExecutionPolicy Bypass -File .\install_task.ps1   # 注册登录自�
 - **三种呈现**：调用 `report` 时同时产出 CLI 屏幕输出（临时查看）、`reports\daily\YYYY-MM-DD.txt`（留档/脚本）、`reports\daily\YYYY-MM-DD.html`（日常阅读，表格 + 红涨绿跌 + 条形图）；`--no-html` 可只出 txt。
 - **门户首页** `reports\index.html`：一页看最近 7 天日报链接、卷已用变化、USN 事件数、告警数、采集/快照状态；每 10 分钟自动刷新。由 `report` 与每次快照完成后自动重写。
 - **自动生成**：daemon 每天在 `daily_report_hour`（默认 8 点）之后，为**昨天**生成一次完整日报并刷新门户（昨天数据完整、避免跨日中途出报告）。生成日期写入 `runtime_state.report.last_auto_day`，重启不重复生成；生成失败只记日志、不影响采集。可用 `daily_report_enabled` 关闭、`daily_report_top` 调整 Top 数。
+- **当日滚动版（2026-11-26 增补）**：每次快照成功合并且当日已有完成的差分窗口时，daemon 用同一文件名（`YYYY-MM-DD`＝今天）重写「今天 00:00 → 现在」的日报并刷新门户，报告的统计区间如实写到最后一次生成时刻，正文多一行「版本：滚动版」。次日 8 点整日版覆盖同一文件，所以面板的「打开日报」永远指向最新的那份；CLI 登录弹窗仍只打开**昨天**（`CDriveSentinel-OpenReport` 行为不变）。可用 `rolling_report_enabled` 关闭；单次成本实测约 1.8 s（当日无窗口时不生成）。只有「今天 00:00 → 现在」这一种会被标成滚动版：手写 `report --since/--until` 查历史区间时不会带这行横幅（`write_report(..., rolling=True)` 显式传入，不由 `until` 推断）。
 - **半成品快照护栏**：`snapshot_meta` 在扫描开始时即插入（`file_count IS NULL`），完成时回填。`status` 与报告的「当前占用 Top」只取 `file_count IS NOT NULL` 的最新快照；若有扫描中的快照，报告显式注明「正在扫描中，数据取自上一次完整快照」，避免只显示已扫描目录的误导值。
 
 #### 与设计的偏差及理由（重要）

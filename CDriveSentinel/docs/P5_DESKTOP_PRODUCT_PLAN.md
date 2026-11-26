@@ -856,5 +856,61 @@ tray --smoke（指向 D:\CDriveSentinelData 活库）   tray_available=True，da
 #### 边界
 
 - 本机活库读取约 0.06 s，弹窗几乎瞬时出现；库更大或机械盘上读取变慢时，弹窗会晚一点出现，但"本次读取 x.xx 秒"会把这件事说清楚。
-- 弹窗只解释「刷新」，「打开日报 / 暂停 / 立即扫描」仍用底栏提示；「打开日报」的当日口径仍是待定项（方案 B：由采集进程滚动生成当日日报），本轮未动。
+- 弹窗只解释「刷新」，「打开日报 / 暂停 / 立即扫描」仍用底栏提示；「打开日报」的当日口径在 10.12 单独处理。
 - QSettings 键在 `HKCU\Software\CDriveSentinel\Tray`，卸载不清理（用户级偏好，重装后保留"不再提示"是合理的）。
+
+### 10.12 面板「打开日报」改为打开当日（2026-11-26）
+
+「打开日报」原先打开 `reports\daily\` 里文件名最大的 HTML，看似"最新"，实际几乎总是**昨天**：守护进程只在每天 8 点后为昨天生成整日版，从不为当天写文件。CLI 的登录弹窗本来就要"看前一天 24 小时"，这个口径没错；但把它搬进面板后，面板上半屏是今日实时数字、按钮却打开昨天的报告，读起来像 bug。
+
+#### 方案 B（已实现）：采集进程滚动生成当日版
+
+| 位置 | 改动 |
+|---|---|
+| `src/p1_report.py` | 新增 `rolling_ready()`（当日必须已有完成的差分窗口，否则不出）与 `write_rolling_report()`：`since=今天 00:00`、`until=现在`，写**同名**文件（`2026-11-26.html/.txt`），"当日无窗口返回 None" |
+| `src/p1_report.py` 渲染 | `write_report(..., rolling=True)` 由滚动版入口显式传入（**不**由 `until` 非空推断，手写 `report --since/--until` 查历史区间不加横幅）；txt 在区间行下加「版本：滚动版（数据截至生成时刻…次日整日版生成后覆盖本文件）」，HTML 加同义 `.note`，避免与次日整日版混淆 |
+| `src/main.py` | 快照成功（`scanned`）后调 `write_rolling_report()`；另外每次 daemon 启动做**一次**补偿（`rolling_seeded`），中途重启不会让面板继续指昨天。都包在 try/except 里，失败只记日志 |
+| `src/p1_config.py` | 新增 `rolling_report_enabled`（默认 true） |
+| `gui/tray.py` | 当日文件存在时按钮变成「打开今日日报」，tooltip 写明文件名；只有旧日报时按钮仍叫「打开日报」，tooltip 说明"今天还没有日报，将打开最近一份 X.html"；打开后在底栏闪「已打开今日日报 2026-11-26（11:20 更新）」或「已打开 2026-11-25 的日报（今天还没有生成…）」 |
+| CLI / 登录弹窗 | **完全不动**：`cmd_open_report` 仍固定打开昨天 |
+
+时序上自洽：今天每次快照覆盖 `今天.html`（滚动版）；次日 8 点后整日版覆盖**同一文件**，于是它自然变成"昨天的完整版"；托盘只会取文件名最大的那份，不需要额外判断。
+
+#### 顺带的性能修正
+
+`build_report_data` 的"当前占用 Top"原先 `file_state JOIN dir_path ... GROUP BY f.dir_id`，SQLite 要逐行回查目录路径：**7.5 s**（124.5 万行 × 17.4 万目录）。改成先 `GROUP BY f.dir_id` 再在 Python 里映射 id→path：**1.7–2.7 s**，与旧查询逐项一致（236 个 top_dir 键、总量 146,396,222,492 B 完全相同，Top 20 一一相等）。滚动版单次总耗时实测 **1.8 s**（`.tmp-ui/rolling_test.py`）。
+
+#### 实测
+
+```
+rolling_test.py（活库只读 + 临时输出目录）
+  current_top 与旧 JOIN 逐项相同        20 vs 20 rows
+  breakdown                            build 1.73s + text/html 渲染 <0.01s（HTML 175 KB）
+  write_rolling_report                 1.75s → 2026-11-26.html / .txt
+  文本横幅                              统计区间 00:00:00 ~ 11:08:35 + 「版本：滚动版…」
+  整日版（明天 8 点写的那份）            无「版本：滚动版」行，区间 00:00:00 ~ 23:59:59
+  旧库（最近 diff_run 11-25）            rolling_ready=False → 返回 None，不生成今日文件
+daemon 集成（SENTINEL_HOME=.tmp-ui/home-roll，活库副本）
+  rolling report updated for 2026-11-26 (html=2026-11-26.html, 1.8s)
+  reports\index.html 同步重写（门户含今日行）
+ui_report_test.py（offscreen）
+  当日文件存在 → 按钮「打开今日日报」，tooltip 带 2026-11-26.html
+  只有昨天文件 → 按钮「打开日报」，tooltip「今天还没有日报，将打开最近一份 2026-11-25.html」
+```
+
+打包态（0.3.5，`dist\CDriveSentinel-0.3.5-Setup.exe`，11:18 构建）：
+
+```
+CDriveSentinel.exe selftest（frozen）  90/90（含 5 项滚动版 + 1 项「历史区间不加横幅」）
+.tmp-ui/verify_frozen_035.py          daemon/cli/tray 三份归档都含新代码；tray 仍不含 p1_report
+uia_report_test.ps1 -Expect today     home 里有今日文件 → 按钮「打开今日日报」，点击后底栏「已打开今日日报 2026-11-26（11:09 更新）」
+uia_report_test.ps1 -Expect fallback  活库（只有 11-25）→ 按钮「打开日报」，底栏「已打开 2026-11-25 的日报（今天还没有生成；09:15 更新）」
+```
+
+注：Qt 不把 `setToolTip()` 文本暴露成 UIA 的 HelpText（读回来是空串），tooltip 文案的验证来自 offscreen 的 `ui_report_test.py`；UIA 只用来证明打包版按钮文字与点击行为。
+
+#### 边界
+
+- 当天还没有任何完成的差分窗口时（刚装好、或刚过零点第一轮扫描前），不出滚动版；按钮保持「打开日报」并打开最近一份旧日报，底栏说明"今天还没有生成"。
+- 滚动版是**当日累计视图**，不是"增量事件清单"：跨零点的差分窗口按 `diff_run.ts_local`（窗口结束时刻）归属到结束日，因此今日报告里会出现昨晚开的那个窗口，这是原有口径，未改。
+- 如果 daemon 被暂停，滚动版停在最后一次快照，底栏的"已打开…（HH:MM 更新）"会显示这个时间。

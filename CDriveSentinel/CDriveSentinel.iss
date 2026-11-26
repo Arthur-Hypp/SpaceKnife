@@ -20,7 +20,7 @@
 ;   history is not something to remove because someone re-ran Setup.
 
 #define AppName        "CDriveSentinel"
-#define AppVer         "0.3.4"
+#define AppVer         "0.3.5"
 #define AppPublisher   "SpaceKnife"
 #define AppExe         "CDriveSentinel.exe"
 #define DaemonExe      "CDriveSentinelDaemon.exe"

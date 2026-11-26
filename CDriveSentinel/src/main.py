@@ -696,6 +696,33 @@ def enforce_budget(conn, cfg, p, log=log):
     return out
 
 
+def write_rolling_report(conn, cfg, paths, top):
+    """Rewrite today's report from midnight to now (never raises).
+
+    The dashboard's "open report" button used to open yesterday's file, which
+    sat awkwardly next to a panel that shows today's numbers. This edition is
+    the same file name yesterday's whole-day report overwrites at the configured
+    hour tomorrow, so the newest report is always today's once a window closed.
+    """
+    started = time.monotonic()
+    try:
+        out = report.write_rolling_report(conn, cfg, paths, top)
+    except Exception as exc:
+        log("rolling report FAILED (daemon continues): %s: %s" %
+            (type(exc).__name__, exc))
+        return None
+    if not out:
+        return None
+    try:
+        report.write_portal(conn, cfg, paths)
+    except Exception as exc:
+        log("portal refresh FAILED (daemon continues): %s: %s" %
+            (type(exc).__name__, exc))
+    log("rolling report updated for %s (html=%s, %.1fs)" % (
+        out["day"], out["html_path"].name, time.monotonic() - started))
+    return out
+
+
 def cmd_daemon(cfg, paths, args):
     conn = db.connect(paths["db"])
     db.init_schema(conn)
@@ -729,6 +756,7 @@ def cmd_daemon(cfg, paths, args):
     except (TypeError, ValueError):
         last_scan_request = 0.0
     paused_seen = None
+    rolling_seeded = False
 
     ticks = 0
     try:
@@ -770,6 +798,12 @@ def cmd_daemon(cfg, paths, args):
                     except Exception as exc:
                         log("daily report FAILED (daemon continues): %s: %s" %
                             (type(exc).__name__, exc))
+            # One rolling-report catch-up per daemon run: a restart mid-day must
+            # not leave the panel pointing at yesterday for the next 30 minutes.
+            if (not rolling_seeded and not args.once and not paused
+                    and cfg.get("rolling_report_enabled", True)):
+                rolling_seeded = True
+                write_rolling_report(conn, cfg, paths, report_top)
             if cfg.get("usn_enabled", True) and not args.no_usn and not paused:
                 current_status = db.get_state(conn, "usn.status")
                 wait = usn_retry if current_status == "permission_denied" else usn_interval
@@ -865,6 +899,10 @@ def cmd_daemon(cfg, paths, args):
                     except Exception as exc:
                         log("budget calibration skipped: %s: %s" %
                             (type(exc).__name__, exc))
+                    # Roll today's report forward now that a window closed:
+                    # from here on "打开日报" means today, matching the panel.
+                    if cfg.get("rolling_report_enabled", True):
+                        write_rolling_report(conn, cfg, paths, report_top)
             if args.once:
                 break
             if args.max_runtime and time.monotonic() - started >= args.max_runtime:
@@ -2292,6 +2330,37 @@ def cmd_selftest(cfg, paths, args):
           and popup_is_due("2026-11-23", "2026-11-24") is True
           and popup_is_due("2026-11-24", "2026-11-24") is False,
           "empty/other-day due, same-day skip")
+
+    # ---- rolling report: the "today" edition the dashboard opens ----
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    check("rolling report: ready once a window closed today",
+          report.rolling_ready(conn) is True)
+    rolled = report.write_rolling_report(conn, scfg, sp, 5)
+    banner = rolled["text"].splitlines() if rolled else []
+    check("rolling report: writes today's file",
+          rolled is not None and rolled["html_path"].name == today + ".html"
+          and rolled["html_path"].is_file(),
+          rolled["html_path"].name if rolled else "None")
+    check("rolling report: banner + range end at generation time",
+          len(banner) > 3 and "版本：滚动版" in banner[3]
+          and (today + " 00:00:00 ~ " + today) in banner[2]
+          and "23:59:59" not in banner[2],
+          banner[2] if len(banner) > 2 else "")
+    whole = report.write_report(conn, scfg, sp, today, None, None, 5)
+    check("whole-day edition is not labelled rolling",
+          "版本：滚动版" not in whole["text"]
+          and ("23:59:59" in whole["text"].splitlines()[2]), "08:00 replacement")
+    ranged = report.write_report(conn, scfg, sp, None,
+                                 today + " 00:00:00", today + " 00:00:01", 5)
+    check("an explicit --since/--until range is not rolling",
+          "版本：滚动版" not in ranged["text"], "historical report")
+    fresh = sqlite3.connect(":memory:")
+    fresh.row_factory = sqlite3.Row
+    db.init_schema(fresh)
+    check("rolling report: nothing to say without a window",
+          report.rolling_ready(fresh) is False
+          and report.write_rolling_report(fresh, scfg, sp, 5) is None)
+    fresh.close()
     conn.close()
 
     failed = [c for c in checks if not c[1]]

@@ -565,7 +565,7 @@ class Dashboard(QWidget):
 
         self.btn_report = QPushButton("打开日报")
         self.btn_report.setObjectName("ghost")
-        self.btn_report.clicked.connect(open_latest_report)
+        self.btn_report.clicked.connect(self._open_report)
         foot.addWidget(self.btn_report)
 
         self.btn_pause = QPushButton("暂停")
@@ -700,6 +700,7 @@ class Dashboard(QWidget):
 
         self.spark.set_data(d.trend)
         self.db_label.setText("数据：%s · 更新于 %s" % (d.db_path, d.refreshed.strftime("%H:%M:%S")))
+        self._update_report_hint()
         if d.error:
             self.subtitle.setText(d.error)
 
@@ -735,6 +736,27 @@ class Dashboard(QWidget):
     def _note_flash(self, text: str, ms: int = 6000) -> None:
         self.note.setText(text)
         QTimer.singleShot(ms, lambda: self.note.setText(NOTE_DEFAULT))
+
+    # ---------------- 「打开日报」: say which day it is
+    def _update_report_hint(self) -> None:
+        """Label the button with the day it will actually open."""
+        path = latest_report()
+        today = dt.date.today().strftime("%Y-%m-%d")
+        if path is None:
+            self.btn_report.setText("打开日报")
+            self.btn_report.setToolTip(
+                "还没有任何日报；完成一次快照后会自动生成当日日报")
+        elif path.stem == today:
+            self.btn_report.setText("打开今日日报")
+            self.btn_report.setToolTip(
+                "打开 %s.html（今天，随每次快照滚动更新）" % path.stem)
+        else:
+            self.btn_report.setText("打开日报")
+            self.btn_report.setToolTip(
+                "今天还没有日报，将打开最近一份 %s.html" % path.stem)
+
+    def _open_report(self) -> None:
+        open_report(self, self._note_flash)
 
     # ---------------- 「刷新」: re-read now, then say what that did
     #
@@ -935,13 +957,43 @@ def latest_report() -> Path | None:
     return None
 
 
-def open_latest_report() -> None:
+def report_note(path: Path) -> str:
+    """One line describing which day's report was opened (and how fresh it is)."""
+    today = dt.date.today().strftime("%Y-%m-%d")
+    try:
+        stamp = dt.datetime.fromtimestamp(path.stat().st_mtime).strftime("%H:%M")
+    except OSError:
+        stamp = "--:--"
+    if path.stem == today:
+        return "已打开今日日报 %s（%s 更新）" % (path.stem, stamp)
+    return "已打开 %s 的日报（今天还没有生成；%s 更新）" % (path.stem, stamp)
+
+
+def open_report(parent=None, note=None) -> None:
+    """Open the newest report; say so when it is not today's.
+
+    The panel shows today's numbers, so silently opening yesterday's file read
+    like a bug. The daemon now rewrites today's file after every snapshot, and
+    this keeps a truthful fallback for the minutes before the day has a window.
+    """
     path = latest_report()
     if not path:
-        QMessageBox.information(None, "暂无日报", "报告目录里还没有 HTML 日报。\n"
-                                "守护进程每天 %s 点生成，也可以先跑一次 report。" % 8)
+        QMessageBox.information(
+            parent, "暂无日报",
+            "报告目录里还没有 HTML 日报。\n\n"
+            "完成一次快照后会自动生成当日日报；每天 %s 点还会生成一份整日版。" % 8)
         return
-    QDesktopServices.openUrl(QUrl.fromLocalFile(str(path)))
+    if not QDesktopServices.openUrl(QUrl.fromLocalFile(str(path))):
+        QMessageBox.warning(parent, "打不开日报",
+                            "系统没能用浏览器打开这个文件：\n%s" % path)
+        return
+    if note is not None:
+        note(report_note(path))
+
+
+def open_latest_report() -> None:
+    # Tray menu entry: no panel to flash a note in, same file selection.
+    open_report()
 
 
 # ------------------------------------------------------------------ tray
