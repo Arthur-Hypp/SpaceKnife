@@ -817,3 +817,44 @@ README.md / 使用说明.txt     已同步一键安装、两个任务、set-home
 - **两个任务的 principal 归属**：`install_popup_task.ps1` 按"安装时的当前用户"注册（`USERDOMAIN\USERNAME`）。per-machine 安装若由管理员账号执行、日常登录是另一账号，日报弹窗任务会挂在管理员账号下而不在日常会话触发。多账号机器需在目标账号下重跑该脚本，或改为 per-user 触发——留给 M3 设置页处理。
 - 脚本安装器 `install.ps1` 与 Inno `.iss` 是两套并行实现，行为对齐但需各自维护；长期应统一到一套生成的安装定义。
 - M1-8（CI 产出安装包 + SHA-256）尚未开始，依赖 ISCC 先在 CI 环境可用。
+
+### 10.11 面板「刷新」可解释化（2026-11-26）
+
+M1-4 的面板底部有四个按钮，其中「刷新」此前只是 `Dashboard.refresh()`：后台重跑一次只读查询再 `_render()`。真实库 318 MB / 124.8 万文件，`datafeed.load()` 实测 **0.05–0.07 s**，所以点下去几乎必然"页面没任何变化"，用户无从判断这一下做了什么（15 s 自动刷新走同一路径，同样无提示）。本轮把它改成"有解释、有结果"的交互，自动刷新保持安静。
+
+#### 改法
+
+| 位置 | 改动 |
+|---|---|
+| `gui/tray.py` 按钮 | `clicked` 从 `self.refresh` 改为 `self._manual_refresh`；补 tooltip「重新读取本机数据库（只读，不触发扫描）」 |
+| `_manual_refresh()` | 记下点击时刻与点击前的 `Dashboard`，再走原有 `refresh()`；若计时器的读取正在跑（`_loading`），不排队第二次查询，由那次 `_on_loaded` 一并汇报 |
+| `_finish_manual_refresh()` | 读取完成后算真实耗时，并对比点击前后的数据 |
+| `_build_refresh_dialog()` | QMessageBox：标题「刷新做了什么」，正文说明"只重读本机数据库、不触发扫描、不写文件"，随后逐行给结果（读取耗时 / 心跳与最近完成快照 / 今日净增与事件数 / 与上次刷新相比的变化 / 面板每 15 s 自动刷新） |
+| 「不再提示」 | QSettings `ui/refresh_hint_hidden`（HKCU\Software\CDriveSentinel\Tray）；勾选后不再弹窗，改为底栏 `_note_flash` 一行「已刷新 HH:MM:SS · 数据 HH:MM:SS · 读取 x.xx 秒」 |
+| 失败路径 | `_on_failed` 里若正在手动刷新，底栏闪现「刷新失败：…」，不再静默 |
+
+#### 顺带修掉的两个真问题
+
+1. **深色模式下弹窗深底深字**：QSS 只给 `QWidget` 设了字色（`#1D2129`），没有任何对话框底色规则。Windows 11 深色模式下 Qt 6 给 QDialog/QMessageBox 的底色是 `#1E1E1E`，实测渲染出来就是深底深字、几乎不可读——受影响的不止新弹窗，既有的「暂无日报」提示也一样。QSS 补 `QDialog, QMessageBox { background: #FFFFFF }`、`QMessageBox QLabel` 与 `QCheckBox` 字色，并给无 objectName 的 `QPushButton` 补一套浅色样式（`#primary`/`#ghost` 的 ID 选择器优先级更高，不受影响）。
+2. **PySide6 的 `setCheckBox()` 不接管 Python 对象所有权**：`remember = QCheckBox(...)` 是 `_build_refresh_dialog` 的局部变量，函数返回后包装对象被回收，`QMessageBox.checkBox()` 随即返回悬空指针——实测直接 **access violation（0xC0000005）**，同一路径还表现为"复选框根本不显示"。修法是让对话框自己持有一份引用（`box._remember = remember`）。这条只在"先 build 再 exec"的写法下暴露；原先 exec 时局部变量还活着，所以是隐性坑。
+
+#### 实测
+
+```
+offscreen 功能测试（.tmp-ui/refresh_test.py，未入库）
+  dialogs        2   （手动一次 + "计时器读取中又点一次" 竞态一次）
+  button         '知道了'
+  checkbox->     True （勾选后写入 setting，第二次点击只闪底栏）
+  note_only_2nd  True
+  race_loading   True （竞态只弹一次、不排队第二次查询）
+  fs_unchanged   True （sentinel.db 与 reports/ 的 mtime_ns 前后一致 → 弹窗不写任何文件）
+  lines_*        四个分支文案：首次 / 无变化 / 有变化 / 数据库尚未创建
+真实字体渲染（WA_DontShowOnScreen，不打扰屏幕）  502×237（150% DPI 下 753×356）
+tray --smoke（指向 D:\CDriveSentinelData 活库）   tray_available=True，dashboard=loaded，state=scanning
+```
+
+#### 边界
+
+- 本机活库读取约 0.06 s，弹窗几乎瞬时出现；库更大或机械盘上读取变慢时，弹窗会晚一点出现，但"本次读取 x.xx 秒"会把这件事说清楚。
+- 弹窗只解释「刷新」，「打开日报 / 暂停 / 立即扫描」仍用底栏提示；「打开日报」的当日口径仍是待定项（方案 B：由采集进程滚动生成当日日报），本轮未动。
+- QSettings 键在 `HKCU\Software\CDriveSentinel\Tray`，卸载不清理（用户级偏好，重装后保留"不再提示"是合理的）。

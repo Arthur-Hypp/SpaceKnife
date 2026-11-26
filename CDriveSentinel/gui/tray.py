@@ -21,6 +21,7 @@ from __future__ import annotations
 import datetime as dt
 import os
 import sys
+import time
 from pathlib import Path
 
 # Source runs need the gui/ folder on sys.path; a frozen build has every module
@@ -28,13 +29,14 @@ from pathlib import Path
 if not getattr(sys, "frozen", False):
     sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from PySide6.QtCore import (QObject, QRectF, QRunnable, QSharedMemory, Qt,
-                            QThreadPool, QTimer, QUrl, Signal)
+from PySide6.QtCore import (QObject, QRectF, QRunnable, QSettings, QSharedMemory,
+                            Qt, QThreadPool, QTimer, QUrl, Signal)
 from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontMetrics, QIcon,
                            QPainter, QPen, QPixmap)
-from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QMenu,
-                               QMessageBox, QPushButton, QSizePolicy,
-                               QSystemTrayIcon, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QFrame, QHBoxLayout,
+                               QLabel, QMenu, QMessageBox, QPushButton,
+                               QSizePolicy, QSystemTrayIcon, QVBoxLayout,
+                               QWidget)
 
 import control_client
 import datafeed
@@ -42,6 +44,15 @@ import setup_client
 from setup_wizard import SetupWizard
 
 NOTE_DEFAULT = "只读监控 · 界面只写 runtime/，从不写库"
+
+# 「刷新」说明弹窗的「不再提示」开关（QSettings，HKCU\Software\CDriveSentinel\Tray）
+REFRESH_HINT_KEY = "ui/refresh_hint_hidden"
+REFRESH_AUTO_SECONDS = 15
+
+
+def _clock(text: str) -> str:
+    """'2026-11-26 10:09:48' -> '10:09:48'; anything odd stays readable."""
+    return text[11:19] if text and len(text) >= 19 else (text or "--")
 
 # ------------------------------------------------------------------ palette
 
@@ -89,6 +100,18 @@ QMenu::item { padding: 7px 26px 7px 14px; border-radius: 6px; font-size: 13px; }
 QMenu::item:selected { background: #EFF4FF; color: #1D4ED8; }
 QMenu::separator { height: 1px; background: %(border)s; margin: 5px 8px; }
 QToolTip { background: #2B2F36; color: #FFFFFF; border: none; padding: 6px 8px; }
+/* Windows 11 深色模式下 Qt 会给对话框深色底，而上面的 QWidget 规则把字定成深色，
+   结果深底深字（实测 #1E1E1E 底 + #1D2129 字）。面板自己有底色不受影响，但弹窗
+   必须显式给浅色底，否则「刷新」的说明根本看不清，已有的「暂无日报」提示也一样。 */
+QDialog, QMessageBox { background: %(card)s; }
+QMessageBox QLabel { color: %(text)s; background: transparent; }
+QCheckBox { color: %(text)s; }
+QPushButton {
+    background: %(card)s; color: %(text)s; border: 1px solid #D9DDE3;
+    border-radius: 8px; padding: 6px 16px; font-size: 13px;
+}
+QPushButton:hover { background: #F2F4F7; }
+QPushButton:pressed { background: #E9ECF1; }
 """ % {"text": TEXT, "bg": BG, "card": CARD, "border": BORDER,
        "mut": MUT, "accent": ACCENT}
 
@@ -395,6 +418,10 @@ class Dashboard(QWidget):
         self.tray = tray
         self.dash: datafeed.Dashboard | None = None
         self._loading = False
+        # Set only by the footer 「刷新」 button; the 15 s timer leaves it None so
+        # the automatic re-read stays silent (see _manual_refresh).
+        self._manual_started: float | None = None
+        self._manual_before: datafeed.Dashboard | None = None
         self._bridge = Bridge(self)
         self._bridge.loaded.connect(self._on_loaded)
         self._bridge.failed.connect(self._on_failed)
@@ -405,7 +432,7 @@ class Dashboard(QWidget):
         self.refresh()
 
         self._timer = QTimer(self)
-        self._timer.setInterval(15000)
+        self._timer.setInterval(REFRESH_AUTO_SECONDS * 1000)
         self._timer.timeout.connect(self.refresh)
         self._timer.start()
 
@@ -532,7 +559,8 @@ class Dashboard(QWidget):
 
         self.btn_refresh = QPushButton("刷新")
         self.btn_refresh.setObjectName("ghost")
-        self.btn_refresh.clicked.connect(self.refresh)
+        self.btn_refresh.setToolTip("重新读取本机数据库（只读，不触发扫描）")
+        self.btn_refresh.clicked.connect(self._manual_refresh)
         foot.addWidget(self.btn_refresh)
 
         self.btn_report = QPushButton("打开日报")
@@ -561,16 +589,22 @@ class Dashboard(QWidget):
         self._pool.start(LoadJob(datafeed.find_db(), self._bridge))
 
     def _on_failed(self, message: str) -> None:
+        manual = self._manual_started is not None
+        self._manual_started = None
+        self._manual_before = None
         self._loading = False
         self.btn_refresh.setEnabled(True)
         self.subtitle.setText("读取失败：%s" % message)
         self.pill.set_state("error")
+        if manual:
+            self._note_flash("刷新失败：%s" % message, 10000)
 
     def _on_loaded(self, dash: datafeed.Dashboard) -> None:
         self._loading = False
         self.btn_refresh.setEnabled(True)
         self.dash = dash
         self._render(dash)
+        self._finish_manual_refresh(dash)
 
     def _render(self, d: datafeed.Dashboard) -> None:
         state = d.state
@@ -701,6 +735,124 @@ class Dashboard(QWidget):
     def _note_flash(self, text: str, ms: int = 6000) -> None:
         self.note.setText(text)
         QTimer.singleShot(ms, lambda: self.note.setText(NOTE_DEFAULT))
+
+    # ---------------- 「刷新」: re-read now, then say what that did
+    #
+    # refresh() only re-runs a read-only query; on a 318 MB database that takes
+    # ~0.06 s, so the page normally does not change and a click looked like a
+    # no-op. The button therefore records when it was pressed and which numbers
+    # were on screen, then reports what the read actually found. The 15 s timer
+    # keeps calling refresh() so the automatic re-read stays silent.
+    def _manual_refresh(self) -> None:
+        if self._manual_started is not None:
+            return                                   # one manual read at a time
+        self._manual_started = time.perf_counter()
+        self._manual_before = self.dash
+        if self._loading:
+            # A timer read is already in flight; its _on_loaded reports instead
+            # of queueing a second query behind it.
+            return
+        self.refresh()
+
+    def _finish_manual_refresh(self, dash: datafeed.Dashboard) -> None:
+        started = self._manual_started
+        if started is None:
+            return
+        before = self._manual_before
+        self._manual_started = None
+        self._manual_before = None
+        elapsed = time.perf_counter() - started
+        if self._refresh_hint_hidden():
+            self._note_flash(self._refresh_one_liner(dash, elapsed), 8000)
+            return
+        self._show_refresh_dialog(before, dash, elapsed)
+
+    def _refresh_one_liner(self, dash: datafeed.Dashboard, elapsed: float) -> str:
+        stamp = dt.datetime.now().strftime("%H:%M:%S")
+        if dash.pending:
+            return "已刷新 %s · 数据库尚未创建（首次扫描后才会有数据）" % stamp
+        return "已刷新 %s · 数据 %s · 读取 %.2f 秒" % (
+            stamp, _clock(dash.capacity.ts or dash.snapshot.ts), elapsed)
+
+    def _show_refresh_dialog(self, before: "datafeed.Dashboard | None",
+                             dash: datafeed.Dashboard, elapsed: float) -> None:
+        box = self._build_refresh_dialog(before, dash, elapsed)
+        box.exec()
+        if box.checkBox().isChecked():
+            self._set_refresh_hint_hidden(True)
+
+    def _build_refresh_dialog(self, before: "datafeed.Dashboard | None",
+                              dash: datafeed.Dashboard, elapsed: float) -> QMessageBox:
+        """Built separately so a test can render it without entering exec()."""
+        box = QMessageBox(self)
+        box.setWindowTitle("刷新做了什么")
+        box.setIcon(QMessageBox.Information)
+        box.setText("「刷新」= 重新读取本机数据库，不触发扫描，也不写任何文件。")
+        box.setInformativeText("\n".join(self._refresh_lines(before, dash, elapsed)))
+        remember = QCheckBox("不再提示（之后只在底栏显示刷新结果）")
+        box.setCheckBox(remember)
+        # PySide6 does not hand the checkbox's ownership to the C++ box: once the
+        # only Python reference goes away the widget is destroyed and box.checkBox()
+        # returns a dangling pointer (measured: access violation on Windows).
+        box._remember = remember
+        box.setStandardButtons(QMessageBox.Ok)
+        ok = box.button(QMessageBox.Ok)
+        if ok is not None:
+            ok.setText("知道了")
+        return box
+
+    def _refresh_lines(self, before: "datafeed.Dashboard | None",
+                       dash: datafeed.Dashboard, elapsed: float) -> list[str]:
+        lines = ["本次读取：%.2f 秒（只读查询，页面数字可能和上次一样）" % elapsed]
+        if dash.pending:
+            lines.append("数据库：尚未创建 —— 守护进程完成首次扫描后才会出现数据")
+        else:
+            lines.append("数据时间：心跳 %s · 最近完成快照 %s"
+                         % (_clock(dash.capacity.ts), _clock(dash.snapshot.ts)))
+            lines.append("今日净增：%s（新增 %s · 移出 %s · %s 条事件）"
+                         % (datafeed.size(dash.today.net, True),
+                            datafeed.size(dash.today.added),
+                            datafeed.size(abs(dash.today.removed)),
+                            format(dash.today.events, ",")))
+        if before is None:
+            lines.append("与上次刷新相比：首次手动刷新，没有可比的上一次")
+        else:
+            changes = []
+            if before.today.net != dash.today.net:
+                changes.append("今日净增 %s → %s"
+                               % (datafeed.size(before.today.net, True),
+                                  datafeed.size(dash.today.net, True)))
+            if before.today.events != dash.today.events:
+                changes.append("事件 %s → %s"
+                               % (format(before.today.events, ","),
+                                  format(dash.today.events, ",")))
+            if (before.snapshot.ts or "") != (dash.snapshot.ts or ""):
+                changes.append("新完成快照 %s" % _clock(dash.snapshot.ts))
+            elif (before.capacity.ts or "") != (dash.capacity.ts or ""):
+                changes.append("心跳 %s → %s"
+                               % (_clock(before.capacity.ts), _clock(dash.capacity.ts)))
+            if before.usn.records != dash.usn.records:
+                changes.append("USN 事件 %s → %s 条"
+                               % (format(before.usn.records, ","),
+                                  format(dash.usn.records, ",")))
+            lines.append("与上次刷新相比：" + ("；".join(changes) if changes
+                                           else "无变化（等下一次快照或心跳才有新数字）"))
+        lines.append("面板每 %d 秒会自动刷新一次；要立刻重新扫描请点「立即扫描」。"
+                     % REFRESH_AUTO_SECONDS)
+        return lines
+
+    def _refresh_hint_hidden(self) -> bool:
+        try:
+            return bool(QSettings("CDriveSentinel", "Tray").value(
+                REFRESH_HINT_KEY, False, type=bool))
+        except Exception:                            # noqa: BLE001
+            return False
+
+    def _set_refresh_hint_hidden(self, hidden: bool) -> None:
+        try:
+            QSettings("CDriveSentinel", "Tray").setValue(REFRESH_HINT_KEY, hidden)
+        except Exception:                            # noqa: BLE001
+            pass
 
     def _ask_scan(self) -> None:
         """Ask the daemon for one snapshot. The UI stays unelevated.

@@ -269,3 +269,8 @@ CDriveSentinel/dist/CDriveSentinel.prev-*/
 *.spec.bak
 # Keep the hand-written build spec (override GitHub's generic *.spec rule)
 !CDriveSentinel/CDriveSentinel.spec
+# Local scratch: UI screenshots / test drivers used while checking the panel, and
+# the backup records from repairing this workspace's file permissions. Neither is
+# part of the product; they stay on disk for reference.
+.tmp-ui/
+acl-recovery/
